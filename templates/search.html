@@ -1,0 +1,13 @@
+<main class="catalog search-page">
+  <p class="eyebrow">WEBSITE SEARCH</p>
+  <h1>Find what you <em>need.</em></h1>
+  <form class="search search-page-form" method="get" action="/search" target="_blank" rel="noopener">
+    <input name="q" value="{{query}}" placeholder="Search products, categories, pages, SKUs or details" aria-label="Search the website" autofocus required>
+    <button class="primary">Search</button>
+  </form>
+  {{page_results}}
+  <section class="search-products">
+    <div class="section-head"><div><p class="eyebrow">PRODUCTS</p><h2>{{count}} results</h2></div></div>
+    <div class="product-grid">{{results}}</div>
+  </section>
+</main>

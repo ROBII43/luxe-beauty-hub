@@ -1,0 +1,1410 @@
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlencode, urlparse, unquote, quote
+from pathlib import Path
+import json
+import csv
+from http.cookies import SimpleCookie
+import secrets
+from datetime import datetime
+import hashlib
+import base64
+import os
+import hmac
+import time
+import io
+import httpx
+import socket
+import threading
+import subprocess
+import sys
+import smtplib
+from email.message import EmailMessage
+import db as database
+from http.server import ThreadingHTTPServer
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import Image as ReportLabImage, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+ROOT = Path(__file__).parent
+DATA = ROOT / 'data.json'
+SESSIONS = {}
+RATE_LIMIT = {}
+RATE_LIMIT_LOCK = threading.Lock()
+MAX_REQUEST_BYTES = 5 * 1024 * 1024
+SESSION_IDLE_SECONDS = 2 * 60 * 60
+SESSION_MAX_SECONDS = 8 * 60 * 60
+DISPLAY_CURRENCY = 'KSh'
+ADMIN_ROLES = {'ADMIN', 'SUPER_ADMIN', 'SUPERADMIN'}
+LAST_SCHEDULED_BACKUP = ''
+MAX_CONCURRENT_REQUESTS = max(16, int(os.environ.get('MAX_CONCURRENT_REQUESTS', '128')))
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 512
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+
+    def process_request(self, request, client_address):
+        if not self.request_slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 19\r\nContent-Type: text/plain\r\nRetry-After: 1\r\n\r\nServer is busy.\n')
+            except OSError:
+                pass
+            finally:
+                request.close()
+            return
+        thread = threading.Thread(target=self.process_request_thread, args=(request, client_address), daemon=True)
+        thread.start()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+            self.shutdown_request(request)
+        except Exception:
+            self.handle_error(request, client_address)
+            self.shutdown_request(request)
+        finally:
+            self.request_slots.release()
+
+def read_db():
+    global DISPLAY_CURRENCY
+    data = database.read_state(DATA)
+    DISPLAY_CURRENCY = data.get('shop', {}).get('currency', 'KSh') or 'KSh'
+    if not data.get('category_hierarchy'):
+        category_file = ROOT / 'categories.json'
+        if category_file.exists():
+            data['category_hierarchy'] = json.loads(category_file.read_text(encoding='utf-8'))
+    if 'CUTE LIFESTYLE ACCESSORIES' in data.get('category_hierarchy', {}) and 'WATCHES' not in data['category_hierarchy']:
+        data['category_hierarchy']['WATCHES'] = data['category_hierarchy'].pop('CUTE LIFESTYLE ACCESSORIES')
+    category_aliases = {
+        'Perfume': 'PERFUMES & FRAGRANCES',
+        'Skincare': 'SKINCARE',
+        'Home & Kitchen': 'KITCHENWARE',
+        'Lifestyle': 'GIFT & LIFESTYLE ITEMS',
+    }
+    for product in data.get('products', []):
+        product['category'] = category_aliases.get(product.get('category'), product.get('category'))
+    for user in data.get('users', []):
+        if user.get('password_hash') == 'scrypt$admin-demo':
+            password = os.environ.get('LUXE_ADMIN_PASSWORD')
+            if os.environ.get('APP_ENV') == 'production' and not password:
+                raise RuntimeError('LUXE_ADMIN_PASSWORD must be configured in production')
+            user['password_hash'] = hash_password(password or 'ChangeMe123!')
+    return data
+
+def write_db(data):
+    data = dict(data)
+    data.pop('_theme', None)
+    database.write_state(data)
+
+def audit(data, session, action, description):
+    data.setdefault('audit_logs', []).append({'user': session.get('customer_name', 'Admin'), 'action': action, 'description': description, 'ip_address': '', 'date': datetime.now().isoformat(timespec='seconds')})
+
+def backup_path():
+    directory = ROOT / 'backups'; directory.mkdir(exist_ok=True)
+    return directory / f'luxe-backup-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json'
+
+def create_backup(data):
+    target = backup_path()
+    target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    return target
+
+def backup_task_command():
+    python_bin = Path(sys.executable).resolve()
+    return f'"{python_bin}" "{ROOT / "server.py"}" --backup-once'
+
+def windows_backup_schedule_name():
+    return 'LuxeBeautyHubBackup'
+
+def apply_windows_backup_schedule(shop):
+    if os.name != 'nt':
+        return None
+    schedule = shop.get('backup_schedule', 'disabled')
+    task_name = windows_backup_schedule_name()
+    task_user = os.environ.get('USERNAME') or os.environ.get('USER') or 'SYSTEM'
+    if schedule == 'disabled':
+        subprocess.run(['schtasks', '/Delete', '/TN', task_name, '/F'], capture_output=True, text=True, check=False, timeout=10)
+        return None
+    trigger = ['schtasks', '/Create', '/F', '/TN', task_name, '/TR', backup_task_command(), '/RU', task_user, '/NP']
+    trigger += ['/ST', str(shop.get('backup_time', '02:00'))]
+    if schedule == 'daily':
+        trigger += ['/SC', 'DAILY']
+    elif schedule == 'weekly':
+        trigger += ['/SC', 'WEEKLY', '/D', str(shop.get('backup_day', 'Sunday')).upper()[:3]]
+    else:
+        return None
+    result = subprocess.run(trigger, capture_output=True, text=True, check=False, timeout=10)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'Windows backup task creation failed')
+    return result
+
+def update_windows_backup_schedule_background(shop):
+    try:
+        apply_windows_backup_schedule(shop)
+    except Exception:
+        pass
+
+def scheduled_backup_loop():
+    global LAST_SCHEDULED_BACKUP
+    while True:
+        time.sleep(30)
+        try:
+            data = read_db()
+            shop = data.get('shop', {})
+            schedule = shop.get('backup_schedule', 'disabled')
+            now = datetime.now()
+            schedule_time = shop.get('backup_time', '02:00')
+            due = schedule in ('daily', 'weekly') and now.strftime('%H:%M') == schedule_time
+            if schedule == 'weekly' and now.strftime('%A') != shop.get('backup_day', 'Sunday'):
+                due = False
+            marker = f'{schedule}:{now.strftime("%Y-%m-%d")}'
+            if due and marker != LAST_SCHEDULED_BACKUP:
+                create_backup(data)
+                LAST_SCHEDULED_BACKUP = marker
+                retention = max(1, int(shop.get('backup_retention', 7)))
+                backups = sorted((ROOT / 'backups').glob('luxe-backup-*.json'), key=lambda item: item.stat().st_mtime, reverse=True)
+                for old_backup in backups[retention:]:
+                    old_backup.unlink(missing_ok=True)
+        except Exception:
+            continue
+
+def category_groups(data):
+    return data.get('category_hierarchy', {})
+
+def category_options(data, selected=''):
+    return ''.join(f'<option value="{esc(category)}" {"selected" if category == selected else ""}>{esc(category)}</option>' for category in category_groups(data))
+
+def subcategory_options(data, selected=''):
+    return ''.join(f'<option value="{esc(subcategory)}" {"selected" if subcategory == selected else ""}>{esc(subcategory)}</option>' for subcategories in category_groups(data).values() for subcategory in subcategories)
+
+def esc(value):
+    return str(value).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+
+def send_json(handler, payload, status=200, filename=None):
+    body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    handler.send_response(status); handler.send_header('Content-Type', 'application/json; charset=utf-8')
+    if filename: handler.send_header('Content-Disposition', f'attachment; filename={filename}')
+    handler.send_header('Cache-Control', 'no-store'); handler.end_headers(); handler.wfile.write(body)
+
+def product_slug(product):
+    return '-'.join(''.join(character.lower() if character.isalnum() else '-' for character in product.get('name', '')).split('-'))
+
+def money(value):
+    return f'{DISPLAY_CURRENCY} {value:,.0f}'
+
+def shop_number(data, key, default):
+    try:
+        return float(data.get('shop', {}).get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+def add_pending_cart(data, session):
+    pending = session.pop('pending_cart', None)
+    if not pending:
+        return False
+    product = next((p for p in data['products'] if p['id'] == pending['id']), None)
+    variant = next((v for v in product.get('variants', []) if v.get('id') == pending.get('variant_id')), None) if product and pending.get('variant_id') else None
+    available_stock = variant.get('stock', 0) if variant else product.get('stock', 0) if product else 0
+    if not product or available_stock < pending['quantity']:
+        return False
+    item = next((entry for entry in session['cart'] if entry['id'] == product['id'] and entry.get('variant_id') == pending.get('variant_id')), None)
+    if item:
+        item['quantity'] = min(available_stock, item['quantity'] + pending['quantity'])
+    else:
+        session['cart'].append({'id': product['id'], 'variant_id': pending.get('variant_id'), 'quantity': pending['quantity']})
+    return True
+
+ORDER_STATUSES = ('Pending', 'Confirmed', 'Processing', 'Ready for Delivery', 'Shipped', 'Delivered', 'Cancelled', 'Returned')
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return 'scrypt$' + salt.hex() + '$' + digest.hex()
+
+def check_password(password, stored):
+    try:
+        _, salt, digest = stored.split('$')
+        actual = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1).hex()
+        return hmac.compare_digest(actual, digest)
+    except (ValueError, TypeError):
+        return False
+
+def send_smtp_email(data, recipients, subject, body):
+    integrations = data.get('integrations', {})
+    host = integrations.get('smtp_host') or os.environ.get('SMTP_HOST', '')
+    port = int(integrations.get('smtp_port') or os.environ.get('SMTP_PORT', '587'))
+    user = integrations.get('smtp_user') or os.environ.get('SMTP_USER', '')
+    password = integrations.get('smtp_password') or os.environ.get('SMTP_PASSWORD', '')
+    sender = integrations.get('smtp_from') or os.environ.get('SMTP_FROM', user)
+    if not host or not sender:
+        raise RuntimeError('SMTP email is not configured')
+    message = EmailMessage()
+    message['Subject'] = subject
+    message['From'] = sender
+    message['To'] = ', '.join(recipients)
+    message.set_content(body)
+    with smtplib.SMTP(host, port, timeout=15) as smtp:
+        smtp.starttls()
+        if user and password:
+            smtp.login(user, password)
+        smtp.send_message(message)
+
+def send_password_otp(data, email, code):
+    send_smtp_email(data, [email], f'{data.get("shop", {}).get("name", "Luxe Beauty Hub")} password reset code', f'Your password reset code is {code}. It expires in 10 minutes. If you did not request this, ignore this email.')
+
+def notify_order_by_email(data, order):
+    recipients = [order.get('email', '').strip()]
+    recipients.extend(user.get('email', '').strip() for user in data.get('users', []) if is_admin_role(user.get('role')) and user.get('active', True))
+    recipients = list(dict.fromkeys(email for email in recipients if email))
+    if not recipients:
+        return
+    items = '; '.join(f'{item.get("product_id")} x {item.get("quantity", 1)} at {money(item.get("unit_price", 0))}' for item in order.get('items', []))
+    body = f'''Order {order.get('order_number')} was placed.
+
+Customer: {order.get('customer_name', '')}
+Email: {order.get('email', '')}
+Phone: {order.get('phone', '')}
+Delivery: {order.get('address', '')}, {order.get('location', '')}
+Payment method: {order.get('payment_method', '')}
+Payment status: {order.get('payment_status', '')}
+Items: {items}
+Subtotal: {money(order.get('subtotal', 0))}
+Delivery: {money(order.get('delivery_fee', 0))}
+Total: {money(order.get('total', 0))}'''
+    try:
+        send_smtp_email(data, recipients, f'New order {order.get("order_number", "")}', body)
+    except (OSError, RuntimeError, smtplib.SMTPException):
+        pass
+
+def notify_order_delivered(data, order):
+    recipients = [order.get('email', '').strip()]
+    recipients.extend(user.get('email', '').strip() for user in data.get('users', []) if is_admin_role(user.get('role')) and user.get('active', True))
+    recipients = list(dict.fromkeys(email for email in recipients if email))
+    if not recipients:
+        return
+    body = f'''Order {order.get('order_number')} has been delivered.
+
+Customer: {order.get('customer_name', '')}
+Delivery location: {order.get('address', '')}, {order.get('location', '')}
+Delivered at: {order.get('delivered_at', '')}
+
+Thank you for shopping with us.'''
+    try:
+        send_smtp_email(data, recipients, f'Order {order.get("order_number", "")} delivered - thank you for shopping with us', body)
+    except (OSError, RuntimeError, smtplib.SMTPException):
+        pass
+
+def forgot_password_page(data, message=''):
+    notice = f'<p class="notice">{esc(message)}</p>' if message else ''
+    body = f'''<main class="auth-page"><section class="auth-card"><div class="auth-card-heading"><span class="auth-icon">↗</span><div><p class="eyebrow">ACCOUNT RECOVERY</p><h2>Reset password</h2></div></div>{notice}<form method="post" class="auth-form"><input type="hidden" name="action" value="forgot_request"><div class="field"><label for="forgot-email">Registered email</label><input id="forgot-email" name="email" type="email" autocomplete="email" required></div><button class="primary auth-submit">Send OTP <span>↗</span></button></form><p class="auth-switch"><a href="/login">Back to sign in</a></p></section></main>'''
+    return layout(data, body)
+
+def reset_password_page(data, email, message=''):
+    notice = f'<p class="notice">{esc(message)}</p>' if message else ''
+    body = f'''<main class="auth-page"><section class="auth-card"><div class="auth-card-heading"><span class="auth-icon">↗</span><div><p class="eyebrow">ACCOUNT RECOVERY</p><h2>Choose a new password</h2></div></div>{notice}<form method="post" class="auth-form"><input type="hidden" name="action" value="forgot_reset"><input type="hidden" name="email" value="{esc(email)}"><div class="field"><label for="reset-code">OTP code</label><input id="reset-code" name="otp" inputmode="numeric" autocomplete="one-time-code" required></div><div class="field"><label for="reset-password">New password</label><input id="reset-password" name="password" type="password" minlength="8" autocomplete="new-password" required></div><button class="primary auth-submit">Reset password <span>↗</span></button></form></section></main>'''
+    return layout(data, body)
+
+def is_admin_role(role):
+    return role in ADMIN_ROLES
+
+def normalize_mpesa_phone(phone):
+    digits = ''.join(character for character in phone if character.isdigit())
+    if digits.startswith('0'):
+        digits = '254' + digits[1:]
+    return digits
+
+def whatsapp_url(phone, message):
+    digits = ''.join(character for character in phone if character.isdigit())
+    if digits.startswith('0'):
+        digits = '254' + digits[1:]
+    if not digits.startswith('254') or len(digits) != 12 or digits[3] not in '17':
+        return ''
+    return f'https://wa.me/{digits}?{urlencode({"text": message})}'
+
+def initiate_mpesa(data, phone, amount, order_number):
+    integrations = data.get('integrations', {})
+    values = {
+        'environment': integrations.get('mpesa_environment') or os.environ.get('MPESA_ENVIRONMENT', 'sandbox'),
+        'shortcode': integrations.get('mpesa_shortcode') or os.environ.get('MPESA_SHORTCODE'),
+        'consumer_key': integrations.get('mpesa_consumer_key') or os.environ.get('MPESA_CONSUMER_KEY'),
+        'consumer_secret': integrations.get('mpesa_consumer_secret') or os.environ.get('MPESA_CONSUMER_SECRET'),
+        'passkey': integrations.get('mpesa_passkey') or os.environ.get('MPESA_PASSKEY'),
+        'callback_url': integrations.get('mpesa_callback_url') or os.environ.get('MPESA_CALLBACK_URL'),
+    }
+    if not all(values.values()):
+        raise RuntimeError('M-Pesa credentials and callback URL are not configured')
+    normalized_phone = normalize_mpesa_phone(phone)
+    if not normalized_phone.startswith('254') or len(normalized_phone) != 12 or normalized_phone[3] not in '17':
+        raise RuntimeError('Enter a valid Kenyan M-Pesa number')
+    host = 'https://api.safaricom.co.ke' if values['environment'] == 'production' else 'https://sandbox.safaricom.co.ke'
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    with httpx.Client(timeout=15.0) as client:
+        auth = client.get(f'{host}/oauth/v1/generate', params={'grant_type': 'client_credentials'}, auth=(values['consumer_key'], values['consumer_secret']))
+        auth.raise_for_status()
+        password = base64.b64encode(f'{values["shortcode"]}{values["passkey"]}{timestamp}'.encode()).decode()
+        response = client.post(f'{host}/mpesa/stkpush/v1/processrequest', headers={'Authorization': f'Bearer {auth.json()["access_token"]}'}, json={
+            'BusinessShortCode': int(values['shortcode']), 'Password': password, 'Timestamp': timestamp,
+            'TransactionType': 'CustomerPayBillOnline', 'Amount': max(1, int(round(amount))),
+            'PartyA': normalized_phone, 'PartyB': int(values['shortcode']), 'PhoneNumber': normalized_phone,
+            'CallBackURL': values['callback_url'], 'AccountReference': order_number, 'TransactionDesc': f'Luxe order {order_number}',
+        })
+        response.raise_for_status()
+        result = response.json()
+    if not result.get('CheckoutRequestID'):
+        raise RuntimeError(result.get('errorMessage') or 'M-Pesa returned no checkout request ID')
+    return result
+
+def apply_mpesa_callback(data, payload):
+    callback = payload.get('Body', {}).get('stkCallback', {})
+    request_id = callback.get('CheckoutRequestID')
+    if not request_id:
+        return False
+    order = next((item for item in data.get('orders', []) if item.get('mpesa_checkout_request_id') == request_id), None)
+    if not order or order.get('payment_status') != 'Pending':
+        return False
+    result_code = callback.get('ResultCode')
+    order['payment_status'] = 'Paid' if result_code == 0 else 'Failed'
+    order['mpesa_result_description'] = callback.get('ResultDesc', '')
+    if result_code == 0:
+        order['status'] = 'Confirmed'
+        order['mpesa_receipt'] = next((item.get('Value') for item in callback.get('CallbackMetadata', {}).get('Item', []) if item.get('Name') == 'MpesaReceiptNumber'), '')
+    return True
+
+def shop_categories(data):
+    legacy_images = {category['name']: category['image'] for category in data.get('categories', [])}
+    images = {
+        'PERFUMES & FRAGRANCES': legacy_images.get('Perfume', ''),
+        'SKINCARE': legacy_images.get('Skincare', ''),
+        'KITCHENWARE': legacy_images.get('Home & Kitchen', ''),
+        'HAIRCARE': 'https://images.unsplash.com/photo-1522338242992-e1a54906a8da?auto=format&fit=crop&w=700&q=85',
+        'MAKEUP & COSMETICS': 'https://images.unsplash.com/photo-1512496015851-a90fb38ba796?auto=format&fit=crop&w=700&q=85',
+        'JEWELLERY': 'https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?auto=format&fit=crop&w=700&q=85',
+        'GIFT & LIFESTYLE ITEMS': 'https://images.unsplash.com/photo-1549465220-1a8b9238cd48?auto=format&fit=crop&w=700&q=85',
+        'WATCHES': 'https://images.unsplash.com/photo-1524805444758-089113d48a6d?auto=format&fit=crop&w=700&q=85',
+        'DUVETS & DUVET COVERS': 'https://images.unsplash.com/photo-1584100936595-c0654b55a2e2?auto=format&fit=crop&w=700&q=85',
+        'COFFEE CUPS': 'https://images.unsplash.com/photo-1514228742587-6b1558fcca3d?auto=format&fit=crop&w=700&q=85',
+        'STANLEY CUPS': 'https://images.unsplash.com/photo-1602143407151-7111542de6e8?auto=format&fit=crop&w=700&q=85',
+        'KITCHEN APPLIANCES': 'https://images.unsplash.com/photo-1556911220-e15b29be8c8f?auto=format&fit=crop&w=700&q=85',
+        'WASHING MACHINES': 'https://images.unsplash.com/photo-1626806787461-102c1bfaaea1?auto=format&fit=crop&w=700&q=85',
+    }
+    descriptions = {'PERFUMES & FRAGRANCES': 'Scent stories for every mood.', 'SKINCARE': 'Thoughtful rituals for luminous skin.', 'HAIRCARE': 'Care for every texture and ritual.', 'JEWELLERY': 'Quiet details with a lasting point of view.', 'GIFT & LIFESTYLE ITEMS': 'Beautiful gestures for every occasion.', 'KITCHENWARE': 'Elevated essentials for daily living.'}
+    fallback = 'https://images.unsplash.com/photo-1556228578-8c89e6adf883?auto=format&fit=crop&w=700&q=80'
+    return ''.join(f'<a href="/category/{esc(category.lower().replace(" ", "-"))}"><img src="{esc(images.get(category, fallback))}" alt="{esc(category)}"><b>{esc(category)}</b><span>{esc(descriptions.get(category, "Curated essentials for everyday living."))}</span><i>View collection ↗</i></a>' for category, subcategories in category_groups(data).items())
+
+def valid_image_upload(filename, content_type, size):
+    allowed = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.svg', '.avif'}
+    suffix = Path(filename).suffix.lower()
+    return suffix in allowed and (content_type.startswith('image/') or content_type in ('application/octet-stream', '')) and 0 < size <= 5 * 1024 * 1024
+
+def parse_form(content_type, raw):
+    if not content_type.startswith('multipart/form-data'):
+        return parse_qs(raw.decode('utf-8', errors='replace'))
+    boundary = content_type.split('boundary=', 1)[-1].strip().encode()
+    fields = {}
+    for part in raw.split(b'--' + boundary):
+        if b'\r\n\r\n' not in part: continue
+        header_bytes, value = part.split(b'\r\n\r\n', 1); value = value.rstrip(b'\r\n-')
+        headers = header_bytes.decode('utf-8', errors='replace')
+        disposition = next((line for line in headers.split('\r\n') if line.lower().startswith('content-disposition:')), '')
+        name_match = __import__('re').search(r'name="([^"]+)"', disposition)
+        if not name_match: continue
+        name = name_match.group(1); filename_match = __import__('re').search(r'filename="([^"]*)"', disposition)
+        if filename_match and filename_match.group(1):
+            filename = Path(filename_match.group(1)).name; content_match = __import__('re').search(r'Content-Type:\s*([^\r\n]+)', headers, __import__('re').I)
+            content = content_match.group(1).strip() if content_match else ''
+            if name == 'backup_file' and content in ('application/json', 'text/plain') and 0 < len(value) <= MAX_REQUEST_BYTES:
+                fields[name] = [value.decode('utf-8', errors='replace')]
+                continue
+            if not valid_image_upload(filename, content, len(value)):
+                fields.setdefault('_upload_errors', []).append(f'Unsupported image upload: {filename}')
+                continue
+            upload_dir = ROOT / 'uploads'; upload_dir.mkdir(exist_ok=True)
+            stem = secrets.token_hex(8)
+            target = upload_dir / f'{stem}{Path(filename).suffix.lower()}'
+            target.write_bytes(value)
+            fields.setdefault(name, []).append('/uploads/' + target.name)
+        else:
+            fields[name] = [value.decode('utf-8', errors='replace')]
+    return fields
+
+def legacy_layout(data, body, theme=None):
+    theme = theme or data.get('_theme', 'light')
+    name = esc(data['shop']['name'])
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(data['shop'].get('description', 'Curated beauty, home and lifestyle essentials'))}"><title>{name}</title><link rel="stylesheet" href="/styles.css"></head><body class="theme-{theme}"><header class="header"><a class="logo" href="/"><b>L</b><span>{name}</span></a><nav><a href="/">Home</a><a href="/?category=Perfume">Shop</a><a href="/?category=Skincare">Self care</a><a href="/?category=Home+%26+Kitchen">Home edit</a><a href="/account">Account</a><a href="/admin">Admin</a></nav><div class="tools">⌕　<a href="/wishlist">♡</a>　<a href="/cart">Bag</a>　<a href="/?theme=light">☀ Light</a>　<a href="/?theme=dark">☾ Dark</a></div></header>{body}<footer><div><a class="logo"><b>L</b><span>{name}</span></a><p>{esc(data['shop']['tagline'])}</p></div><div><strong>Explore</strong><a href="/">Shop all</a><a href="/?category=Perfume">New arrivals</a><a href="/">Gifts</a></div><div><strong>Client care</strong><a>Delivery & returns</a><a>Contact us</a><a>WhatsApp concierge</a></div><div><strong>Stay in the know</strong><p>Notes on beauty, home and living.</p><p>Phone: {esc(data['shop'].get('phone', ''))}</p><p>Email: {esc(data['shop'].get('email', ''))}</p></div></footer></body></html>'''
+
+def render_template(filename, values):
+    template = (ROOT / 'templates' / filename).read_text(encoding='utf-8')
+    for key, value in values.items():
+        template = template.replace('{{' + key + '}}', str(value))
+    return template
+
+def logo_mark(shop, size='small'):
+    image = shop.get('logo', '').strip()
+    name = esc(shop.get('name', 'Luxe Beauty Hub'))
+    if image and logo_source_available(image):
+        return f'<img class="brand-logo {size}" src="{esc(image)}" alt="{name}" loading="lazy" referrerpolicy="no-referrer">'
+    return f'<b>{esc(name[:1] or "L")}</b>'
+
+
+def run_backup_once():
+    data = read_db()
+    backup = create_backup(data)
+    retention = max(1, int(data.get('shop', {}).get('backup_retention', 7)))
+    backup_dir = ROOT / 'backups'
+    backup_dir.mkdir(exist_ok=True)
+    backups = sorted(backup_dir.glob('luxe-backup-*.json'), key=lambda item: item.stat().st_mtime, reverse=True)
+    for old_backup in backups[retention:]:
+        old_backup.unlink(missing_ok=True)
+    print(f'Backup created: {backup}')
+    return backup
+
+def layout(data, body, theme=None):
+    theme = theme or data.get('_theme', 'light')
+    shop = data['shop']
+    admin_role = data.get('_admin_role')
+    admin_label = 'Superadmin' if admin_role in ('SUPER_ADMIN', 'SUPERADMIN') else 'Admin' if admin_role == 'ADMIN' else ''
+    rendered = render_template('base.html', {
+        'description': esc(shop.get('description', 'Curated beauty, home and lifestyle essentials')),
+        'title': esc(shop['name']),
+        'theme': esc(theme),
+        'header': render_template('header.html', {'shop_name': esc(shop['name']), 'logo_html': logo_mark(shop, 'small'), 'wishlist_badge': f'<sup>{data.get("_wishlist_count", 0)}</sup>' if data.get('_wishlist_count', 0) else '', 'cart_badge': f'<sup>{data.get("_cart_count", 0)}</sup>' if data.get('_cart_count', 0) else '', 'account_link': data.get('_account_link', '/login'), 'wishlist_link': data.get('_wishlist_link', '/login'), 'cart_link': data.get('_cart_link', '/login'), 'auth_link': data.get('_auth_link', ''), 'admin_link': f'<a class="admin-nav-link" href="/admin">{admin_label}</a>' if admin_label else ''}),
+        'content': body,
+        'footer': render_template('footer.html', {'shop_name': esc(shop['name']), 'logo_html': logo_mark(shop, 'small'), 'tagline': esc(shop.get('tagline', '')), 'phone': esc(shop.get('phone', '')), 'whatsapp': esc(shop.get('whatsapp', '')), 'email': esc(shop.get('email', '')), 'location': esc(shop.get('location', '')), 'delivery_information': esc(shop.get('delivery_information', '')), 'return_policy': esc(shop.get('return_policy', '')), 'refund_policy': esc(shop.get('return_policy', '')), 'privacy_policy': esc(shop.get('privacy_policy', '')), 'terms': esc(shop.get('terms', '')), 'instagram': esc(shop.get('social', {}).get('instagram', '')), 'facebook': esc(shop.get('social', {}).get('facebook', '')), 'tiktok': esc(shop.get('social', {}).get('tiktok', ''))}),
+    })
+    return rendered.replace('<form class="search">', '<form class="search" target="_blank" rel="noopener">')
+
+def card(p):
+    sale = f'<del>{money(p["old_price"])}</del>' if p.get('old_price') else ''
+    sold = '<div class="sold">Out of stock</div>' if not p['stock'] else ''
+    button = 'Unavailable' if not p['stock'] else 'Add to bag ↗'
+    disabled = 'disabled' if not p['stock'] else ''
+    return f'''<article class="product-card"><div class="product-image"><a href="/product?id={p['id']}"><img src="{esc(p['image'])}" alt="{esc(p['name'])}" loading="lazy"></a><span class="tag">{esc(p['tag'])}</span><form method="post" class="wishlist-card-form"><input type="hidden" name="action" value="wishlist"><input type="hidden" name="product_id" value="{p['id']}"><button class="heart" aria-label="Save {esc(p['name'])} to wishlist">♡</button></form>{sold}</div><div class="meta"><div><small>{esc(p['brand'])}</small><h3>{esc(p['name'])}</h3></div><span class="rating">★ {p['rating']}</span></div><div class="price"><b>{money(p['price'])}</b>{sale}<form method="post"><input type="hidden" name="action" value="cart"><input type="hidden" name="product_id" value="{p['id']}"><button {disabled}>{button}</button></form></div></article>'''
+
+HOMEPAGE_SECTIONS = ('New Arrivals', 'Best Sellers', 'Featured Products', 'Trending Products', 'Special Offers', 'Recommended Products')
+
+def homepage_sections(data):
+    sections = []
+    for section in HOMEPAGE_SECTIONS:
+        products = [product for product in data.get('products', []) if section in product.get('featured_sections', [])]
+        if products:
+            sections.append(f'<section class="catalog homepage-section"><div class="section-head"><div><p class="eyebrow">CURATED FOR YOU</p><h2>{esc(section)}</h2></div></div><div class="product-grid">{"".join(card(product) for product in products[:8])}</div></section>')
+    shop = data.get('shop', {})
+    story = shop.get('story_description', 'Curated beauty. Thoughtful essentials. Everyday luxury.')
+    newsletter = shop.get('newsletter_description', 'Join our circle for new arrivals, considered edits and occasional offers.')
+    sections.append(f'<section class="manifesto brand-story"><p class="eyebrow">OUR POINT OF VIEW</p><h2>{esc(shop.get("story_heading", "Beautiful things for everyday living."))}</h2><p>{esc(story)}</p><a class="under" href="/about">Read our story ↗</a></section>')
+    sections.append(f'<section class="newsletter"><div><p class="eyebrow">THE LUXE LETTER</p><h2>{esc(shop.get("newsletter_heading", "A little beauty, delivered."))}</h2><p>{esc(newsletter)}</p></div><form method="post"><input type="hidden" name="action" value="newsletter"><input name="email" type="email" placeholder="Your email address" required><button class="primary">Subscribe ↗</button></form></section>')
+    return ''.join(sections)
+
+def home(data, query):
+    q = query.get('q',[''])[0].lower(); category = query.get('category',['All'])[0]; section = query.get('section',[''])[0]
+    brand = query.get('brand',['All'])[0]; availability = query.get('availability',['All'])[0]; sort = query.get('sort',['latest'])[0]
+    products = [p for p in data['products'] if (not section or section in p.get('featured_sections', [])) and (category == 'All' or p['category'] == category) and (brand == 'All' or p['brand'] == brand) and (availability == 'All' or availability == 'in-stock' and p['stock'] > 0 or availability == 'discount' and p.get('old_price')) and q in f"{p.get('name', '')} {p.get('brand', '')} {p.get('category', '')} {p.get('subcategory', '')} {p.get('sku', '')} {p.get('description', '')} {' '.join(p.get('tags', []))} {json.dumps(p.get('specifications', {}))} {json.dumps(p.get('variants', []))}".lower()]
+    if sort == 'price-low': products.sort(key=lambda p: p['price'])
+    elif sort == 'price-high': products.sort(key=lambda p: p['price'], reverse=True)
+    elif sort == 'rating': products.sort(key=lambda p: p.get('rating', 0), reverse=True)
+    elif sort == 'name': products.sort(key=lambda p: p['name'].lower())
+    page_matches = ''
+    searchable_pages = (('About us', '/about', data['shop'].get('description', '') + data['shop'].get('story_description', '')), ('Delivery information', '/delivery', data['shop'].get('delivery_information', '')), ('Returns and refunds', '/returns', data['shop'].get('return_policy', '')), ('FAQs', '/faq', 'Frequently asked questions'))
+    if q:
+        page_matches = ''.join(f'<a class="search-result-link" href="{href}"><b>{label}</b><small>Open page ↗</small></a>' for label, href, content in searchable_pages if q in content.lower())
+        if page_matches: page_matches = f'<div class="search-page-results"><p class="eyebrow">WEBSITE PAGES</p>{page_matches}</div>'
+    cards = page_matches + (''.join(card(p) for p in products) or '<p class="empty">Nothing found in this edit.</p>')
+    pills = ''.join(f'<a class="pill {"active" if c == category else ""}" href="{("/shop" if c == "All" else "/category/" + c.lower().replace(" ", "-"))}">{c}</a>' for c in ['All'] + list(category_groups(data)))
+    hero = data['shop'].get('hero', {})
+    brands = sorted({p['brand'] for p in data['products']})
+    brand_options = ''.join(f'<option value="{esc(item)}">' for item in brands)
+    return layout(data, f'''<main><section class="hero"><div class="hero-copy"><p class="eyebrow">THE EVERYDAY EDIT / 01</p><h1>{esc(hero.get('heading', 'Discover something beautiful.')).replace(' ', '<br>')}</h1><p class="hero-text">{esc(hero.get('description', 'Thoughtful objects, sensory rituals and little luxuries for living well.'))}</p><a class="primary" href="{esc(hero.get('primary_link', '#catalog'))}">{esc(hero.get('primary_label', 'Shop the edit'))} ↗</a></div><div class="hero-image"><img src="{esc(hero.get('image', ''))}" alt="{esc(hero.get('heading', 'Shop collection'))}"><span class="stamp">BEAUTY<br>• HOME<br>• LIFE</span></div></section><section class="categories"><div class="section-head"><div><p class="eyebrow">SHOP BY MOOD</p><h2>Find your next <em>favourite.</em></h2></div><a class="under">View all categories ↗</a></div><div class="category-grid">{shop_categories(data)}</div></section>{homepage_sections(data)}<section class="catalog" id="catalog"><div class="section-head"><div><p class="eyebrow">{'SEARCH RESULTS FOR "' + esc(query.get('q',[''])[0]) + '"' if query.get('q',[''])[0] else 'THE CURRENT EDIT'}</p><h2>Pieces worth <em>keeping.</em></h2></div><form class="search"><input name="q" value="{esc(query.get('q',[''])[0])}" list="brand-list" placeholder="Search name, brand, SKU or tag"><datalist id="brand-list">{brand_options}</datalist><select name="brand"><option>All</option>{''.join(f'<option>{esc(item)}</option>' for item in brands)}</select><select name="availability"><option value="All">Any stock</option><option value="in-stock">In stock</option><option value="discount">Discounts</option></select><select name="sort"><option value="latest">Latest</option><option value="price-low">Price low to high</option><option value="price-high">Price high to low</option><option value="rating">Best rated</option><option value="name">Name A-Z</option></select><button>Search</button></form></div><div class="pills">{pills}</div><div class="product-grid">{cards}</div></section><section class="manifesto"><p class="eyebrow">OUR POINT OF VIEW</p><h2>Beauty is in the <em>details.</em></h2><p>We seek out the things that make an ordinary day feel considered.</p><a class="under">About Luxe ↗</a></section></main>''')
+
+def legacy_admin(data, message=''):
+    total_sales = sum(order.get('total', 0) for order in data.get('orders', []))
+    low_stock = sum(1 for product in data['products'] if 0 < product.get('stock', 0) <= product.get('minimum_stock', 5))
+    out_of_stock = sum(1 for product in data['products'] if product.get('stock', 0) == 0)
+    section_options = ''.join(f'<option>{section}</option>' for section in HOMEPAGE_SECTIONS)
+    rows = ''.join(f'''<div class="table-row"><span class="admin-product"><img src="{esc(p['image'])}" loading="lazy"><b>{esc(p['name'])}<small>{esc(p['brand'])} · SKU-00{p['id']}</small></b></span><span>{esc(p['category'])}</span><span>{money(p['price'])}</span><span>{p['stock']}</span><span><i class="status">{'Out' if not p['stock'] else 'Low stock' if p['stock'] <= 5 else 'In stock'}</i></span><span><a class="under" href="/admin/products/edit?id={p['id']}">Edit</a><form method="post"><input type="hidden" name="action" value="product_delete"><input type="hidden" name="product_id" value="{p['id']}"><button onclick="return confirm('Delete this product?')">Delete</button></form><form method="post"><input type="hidden" name="action" value="stock"><input type="hidden" name="product_id" value="{p['id']}"><button name="amount" value="1">＋</button><button name="amount" value="-1">−</button></form><form method="post"><input type="hidden" name="action" value="feature"><input type="hidden" name="product_id" value="{p['id']}"><select name="section">{section_options}</select><button>Feature</button></form></span></div>''' for p in data['products'])
+    return layout(data, f'''<main class="admin-page"><div class="admin-shell"><aside class="sidebar"><div class="admin-logo">L　CONTROL<br>　 ROOM</div><p>WORKSPACE</p><a class="selected" href="/admin">▦ Overview</a><a href="/admin/products">□ Products <span>{len(data['products'])}</span></a><a href="/admin/categories">▤ Categories <span>{len(category_groups(data))}</span></a><a href="/admin/orders">▱ Orders <span>{len(data.get('orders', []))}</span></a><a href="/admin/payments">▣ Payments</a><a href="/admin/deliveries">▰ Deliveries</a><a href="/admin/customers">♙ Customers</a><p>MANAGE</p><a href="/admin/promotions">◇ Promotions</a><a href="/admin/settings">⚙ Settings</a><a href="/admin/staff">♙ Staff</a><a href="/admin/audit">▤ Audit logs</a><a href="/admin/backup">⇩ Backup database</a><a href="/admin/restore">⇧ Restore database</a></aside><section class="admin-content"><div class="section-head"><div><p class="eyebrow">THURSDAY, 03 SEPTEMBER 2026</p><h1>Good morning, <em>Admin.</em></h1></div><a class="under" href="/">View storefront ↗</a></div>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<div class="stats"><div><span>Total sales</span><b>{money(total_sales)}</b><small>Calculated from orders</small></div><div><span>Total orders</span><b>{len(data.get('orders', []))}</b><small>Managed from admin</small></div><div><span>Customers</span><b>{len(data.get('customers', []))}</b><small>Managed from admin</small></div><div><span>Products</span><b>{len(data['products'])}</b><small>{low_stock} low stock · {out_of_stock} out</small></div></div><div class="admin-grid"><section class="panel"><div class="section-head"><div><p class="eyebrow">CATALOGUE</p><h2>Product inventory</h2></div><a class="primary" href="/admin/products">＋ Add product</a></div><div class="table"><div class="table-row table-head"><span>Product</span><span>Category</span><span>Price</span><span>Stock</span><span>Status</span><span></span></div>{rows}</div></section><section class="panel"><p class="eyebrow">SETTINGS</p><h2>Shop information</h2><form method="post"><input type="hidden" name="action" value="settings"><label>Shop name<input name="shop_name" value="{esc(data['shop']['name'])}"></label><label>Currency<select disabled><option>KSh — Kenyan Shilling</option></select></label><label>WhatsApp number<input value="{esc(data['shop']['whatsapp'])}"></label><button class="primary">Save changes ✓</button></form><small class="note">All storefront prices and reports use Kenyan shillings.</small></section></div></section></div></main>''')
+
+def admin(data, message=''):
+    orders = data.get('orders', [])
+    today = datetime.now().date().isoformat()
+    today_sales = sum(order.get('total', 0) for order in orders if str(order.get('created_at', '')).startswith(today))
+    pending = sum(1 for order in orders if order.get('status') == 'Pending')
+    completed = sum(1 for order in orders if order.get('status') == 'Delivered')
+    total_sales = sum(order.get('total', 0) for order in orders)
+    low_stock = sum(1 for product in data.get('products', []) if 0 < product.get('stock', 0) <= product.get('minimum_stock', 5))
+    out_of_stock = sum(1 for product in data.get('products', []) if product.get('stock', 0) == 0)
+    sales_by_day = {}
+    for order in orders:
+        day = str(order.get('created_at', ''))[:10]
+        sales_by_day[day] = sales_by_day.get(day, 0) + order.get('total', 0)
+    recent_days = sorted(sales_by_day)[-7:]
+    max_sales = max([sales_by_day.get(day, 0) for day in recent_days] or [1])
+    chart = ''.join(f'<div class="chart-bar"><span style="height:{max(8, round(sales_by_day.get(day, 0) / max_sales * 100))}%"></span><small>{esc(day[-5:])}</small></div>' for day in recent_days) or '<p class="note">Sales activity will appear here after the first order.</p>'
+    rows = ''.join(f'<div class="table-row"><span class="admin-product"><img src="{esc(product.get("image", ""))}" loading="lazy"><b>{esc(product.get("name", ""))}<small>{esc(product.get("sku", ""))}</small></b></span><span>{esc(product.get("category", ""))}</span><span>{money(product.get("price", 0))}</span><span>{product.get("stock", 0)}</span><span><i class="status">{"Out" if not product.get("stock") else "Low stock" if product.get("stock", 0) <= product.get("minimum_stock", 5) else "In stock"}</i></span><span><a class="under" href="/admin/products/edit?id={product.get("id")}">Edit</a></span></div>' for product in data.get('products', [])[:12]) or '<p class="empty">No products have been added yet.</p>'
+    sidebar = f'''<aside class="sidebar"><div class="admin-logo">L　CONTROL<br>　 ROOM</div><p>WORKSPACE</p><a class="selected" href="/admin">▦ Dashboard</a><a href="/admin/products">□ Products <span>{len(data.get('products', []))}</span></a><a href="/admin/categories">▤ Categories <span>{len(category_groups(data))}</span></a><a href="/admin/orders">▱ Orders <span>{len(orders)}</span></a><a href="/admin/customers">♙ Customers <span>{len(data.get('customers', []))}</span></a><a href="/admin/reviews">☆ Reviews</a><p>OPERATIONS</p><a href="/admin/payments">▣ Payments</a><a href="/admin/deliveries">▰ Deliveries</a><a href="/admin/promotions">◇ Coupons & promotions</a><a href="/admin/reports">◫ Reports</a><p>SETTINGS</p><a href="/admin/settings">⚙ Shop information</a><a href="/admin/staff">♙ Users & roles</a><a href="/admin/audit">▤ Audit logs</a><a href="/admin/backup">⇩ Backup database</a><a href="/admin/restore">⇧ Restore database</a></aside>'''
+    body = f'''<main class="admin-page"><div class="admin-shell">{sidebar}<section class="admin-content"><div class="section-head"><div><p class="eyebrow">BUSINESS OVERVIEW</p><h1>Good morning, <em>Admin.</em></h1></div><a class="under" href="/">View storefront ↗</a></div>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<div class="stats"><div><span>Total sales</span><b>{money(total_sales)}</b><small>All recorded orders</small></div><div><span>Today's sales</span><b>{money(today_sales)}</b><small>{today}</small></div><div><span>Pending orders</span><b>{pending}</b><small>{completed} delivered</small></div><div><span>Customers</span><b>{len(data.get('customers', []))}</b><small>{len(data.get('products', []))} products</small></div><div><span>Low stock</span><b>{low_stock}</b><small>{out_of_stock} out of stock</small></div></div><div class="admin-grid"><section class="panel sales-chart"><div class="section-head"><div><p class="eyebrow">SALES PERFORMANCE</p><h2>Recent sales</h2></div><a class="under" href="/admin/reports">View reports ↗</a></div><div class="chart-bars">{chart}</div></section><section class="panel"><p class="eyebrow">QUICK ACTIONS</p><h2>Keep things moving.</h2><div class="quick-actions"><a class="primary" href="/admin/products">Add product ↗</a><a class="under" href="/admin/orders">Review orders</a><a class="under" href="/admin/settings">Edit storefront</a></div></section></div><section class="panel"><div class="section-head"><div><p class="eyebrow">INVENTORY</p><h2>Product health</h2></div><a class="primary" href="/admin/products">Manage products ↗</a></div><div class="table"><div class="table-row table-head"><span>Product</span><span>Category</span><span>Price</span><span>Stock</span><span>Status</span><span></span></div>{rows}</div></section></section></div></main>'''
+    return layout(data, body)
+
+def product_page(data, product, session=None):
+    images = product.get('images', [product['image']])
+    gallery = ''.join(f'<img src="{esc(image)}" alt="{esc(product["name"])} thumbnail">' for image in images)
+    original = f'<del>{money(product["old_price"])}</del>' if product.get('old_price') else ''
+    discount = f'<span class="discount">{round((1 - product["price"] / product["old_price"]) * 100)}% off</span>' if product.get('old_price') else ''
+    specifications = ''.join(f'<li><b>{esc(key.replace("_", " "))}</b> {esc(value)}</li>' for key, value in product.get('specifications', {}).items())
+    variants = [variant for variant in product.get('variants', []) if variant.get('active', True)]
+    variant_options = ''.join(f'<option value="{variant.get("id", index)}">{esc(variant.get("name", "Option"))} · {money(variant.get("price", product["price"]))}</option>' for index, variant in enumerate(variants, 1))
+    variant_control = f'<label>Choose an option<select name="variant_id">{variant_options}</select></label>' if variants else ''
+    purchase = f'''<form method="post"><input type="hidden" name="action" value="cart"><input type="hidden" name="product_id" value="{product['id']}">{variant_control}<label>Quantity<input name="quantity" type="number" value="1" min="1" max="{product['stock']}"></label><div class="detail-actions"><button class="primary" {'disabled' if not product['stock'] else ''}>{'Add to cart ↗' if product['stock'] else 'OUT OF STOCK'}</button><button class="buy-now" name="buy_now" value="1" {'disabled' if not product['stock'] else ''}>Buy now</button></div></form>'''
+    customer_name = session.get('customer_name', 'Customer') if session else 'Customer'
+    whatsapp_message = f"Is this product available? Product: {product['name']}. Brand: {product.get('brand', '')}. SKU: {product.get('sku', '')}. Price: {money(product['price'])}."
+    whatsapp = whatsapp_url(data['shop'].get('whatsapp', ''), whatsapp_message)
+    reviews = ''.join(f'<div class="review"><b>{esc(review.get("customer_name", "Customer"))} · {"★" * int(review.get("rating", 5))}</b><p>{esc(review.get("text", ""))}</p></div>' for review in data.get('reviews', []) if review.get('product_id') == product['id'] and review.get('approved', True))
+    review_count = len([review for review in data.get('reviews', []) if review.get('product_id') == product['id'] and review.get('approved', True)])
+    whatsapp_link = f'<a class="whatsapp-button" href="{esc(whatsapp)}" target="_blank" rel="noopener">◉ Ask about this product on WhatsApp</a>' if whatsapp else '<span class="note">WhatsApp contact is not configured.</span>'
+    product_links = f'<form method="post"><input type="hidden" name="action" value="wishlist"><input type="hidden" name="product_id" value="{product["id"]}"><button class="under">Add to wishlist ♡</button></form><a class="under" href="/cart">View shopping bag ↗</a>{whatsapp_link}<a class="under" href="mailto:?subject={esc(product["name"])}">Share product</a>'
+    review_form = f'<form method="post" class="review-form"><input type="hidden" name="action" value="review"><input type="hidden" name="product_id" value="{product["id"]}"><select name="rating"><option value="5">★★★★★</option><option value="4">★★★★</option><option value="3">★★★</option><option value="2">★★</option><option value="1">★</option></select><textarea name="text" placeholder="Share your experience" required></textarea><button class="under">Submit review</button></form>'
+    related = ''.join(card(item) for item in data.get('products', []) if item.get('id') != product.get('id') and item.get('category') == product.get('category'))
+    body = render_template('product.html', {'image': esc(product['image']), 'name': esc(product['name']), 'gallery': gallery, 'category': esc(product['category']), 'brand': esc(product['brand']), 'rating': product['rating'], 'review_count': review_count, 'price': money(product['price']), 'original': original, 'discount': discount, 'description': esc(product.get('description', 'A considered addition to your everyday ritual.')), 'stock_message': 'In stock · ships within 24 hours' if product['stock'] else 'OUT OF STOCK', 'purchase': purchase, 'product_links': product_links, 'specifications': specifications, 'reviews': reviews or '<p class="note">No approved reviews yet.</p>', 'review_form': review_form, 'related_products': related or '<p class="note">Explore the full collection for more considered pieces.</p>'})
+    return layout(data, body)
+
+def cart_page(data, session):
+    items = []
+    for item in session['cart']:
+        product = next((p for p in data['products'] if p['id'] == item['id']), None)
+        variant = next((v for v in product.get('variants', []) if str(v.get('id')) == str(item.get('variant_id'))) , None) if product and item.get('variant_id') else None
+        if product: items.append((product, item['quantity'], variant, item))
+    subtotal = sum((variant or {}).get('price', product['price']) * quantity for product, quantity, variant, item in items)
+    discount = sum((product.get('old_price', (variant or {}).get('price', product['price'])) - (variant or {}).get('price', product['price'])) * quantity for product, quantity, variant, item in items)
+    free_delivery_threshold = shop_number(data, 'free_delivery_threshold', 10000)
+    delivery_fee = shop_number(data, 'delivery_fee', 350)
+    delivery = 0 if not items or subtotal >= free_delivery_threshold else delivery_fee
+    total = subtotal + delivery
+    rows = ''.join(f'''<div class="checkout-row cart-line"><span>{esc(product['name'])}{f' · {esc(variant.get("name", ""))}' if variant else ''} × {quantity}</span><b>{money((variant or {}).get('price', product['price']) * quantity)}</b><form method="post"><input type="hidden" name="action" value="cart_update"><input type="hidden" name="product_id" value="{product['id']}"><input type="hidden" name="variant_id" value="{item.get('variant_id', '')}"><button name="change" value="-1">−</button><button name="change" value="1">＋</button></form><form method="post"><input type="hidden" name="action" value="cart_remove"><input type="hidden" name="product_id" value="{product['id']}"><button class="under">Remove</button></form></div>''' for product, quantity, variant, item in items)
+    whatsapp_text = '; '.join(f'{p["name"]} x {quantity} - {money((variant or {}).get("price", p["price"]) * quantity)}' for p, quantity, variant, item in items)
+    whatsapp = urlencode({'phone': data['shop'].get('whatsapp', '').replace('+', ''), 'text': f'Hello, I would like to order: {whatsapp_text}. Order total: {money(total)}. Customer: {session.get("customer_name", "Customer")}'})
+    actions = '<a class="primary" href="/checkout">Proceed to checkout ↗</a><a class="whatsapp-button" href="/checkout?payment=whatsapp">ORDER VIA WHATSAPP</a>' if items else '<p class="note">Your bag is empty.</p>'
+    body = render_template('cart.html', {'rows': rows or '<p class="empty">Your bag is waiting.</p>', 'subtotal': money(subtotal), 'discount': money(discount), 'delivery': 'FREE' if delivery == 0 else money(delivery), 'total': money(total), 'actions': actions})
+    return layout(data, body)
+
+def checkout_page(data, session, message='', whatsapp_order=False):
+    items = []
+    for item in session.get('cart', []):
+        product = next((p for p in data['products'] if p['id'] == item['id']), None)
+        variant = next((v for v in product.get('variants', []) if str(v.get('id')) == str(item.get('variant_id'))), None) if product and item.get('variant_id') else None
+        if product: items.append(f'<div class="checkout-row"><span>{esc(product["name"])} × {item["quantity"]}</span><b>{money((variant or {}).get("price", product["price"]) * item["quantity"])}</b></div>')
+    return layout(data, render_template('checkout.html', {'items': ''.join(items), 'message': f'<p class="notice">{esc(message)}</p>' if message else '', 'payment_method_m_pesa': '' if whatsapp_order else 'selected', 'payment_method_whatsapp': 'selected' if whatsapp_order else ''}))
+def cart_item_variant(data, item):
+    product = next((p for p in data.get('products', []) if p['id'] == item.get('id')), None)
+    return next((variant for variant in product.get('variants', []) if str(variant.get('id')) == str(item.get('variant_id'))), None) if product and item.get('variant_id') else None
+
+def cart_item_price(data, item):
+    product = next((p for p in data.get('products', []) if p['id'] == item.get('id')), None)
+    variant = cart_item_variant(data, item)
+    return (variant or {}).get('price', product.get('price', 0)) if product else 0
+
+def info_page(data, eyebrow, title, intro, body):
+    return layout(data, render_template('info.html', {'eyebrow': esc(eyebrow), 'title': esc(title), 'intro': esc(intro), 'body': body}))
+
+def category_page(data, category, query=''):
+    descriptions = {'PERFUMES & FRAGRANCES': 'Scent stories for every mood.', 'SKINCARE': 'Thoughtful rituals for luminous skin.', 'HAIRCARE': 'Care for every texture and ritual.', 'JEWELLERY': 'Quiet details with a lasting point of view.', 'GIFT & LIFESTYLE ITEMS': 'Beautiful gestures for every occasion.', 'KITCHENWARE': 'Elevated essentials for daily living.'}
+    normalized_query = query.lower().strip()
+    products = [product for product in data.get('products', []) if product.get('category') == category and normalized_query in f'{product.get("name", "")} {product.get("brand", "")} {product.get("sku", "")} {" ".join(product.get("tags", []))}'.lower()]
+    pills = ''.join(f'<a class="pill {"active" if item == category else ""}" href="/category/{item.lower().replace(" ", "-")}">{esc(item)}</a>' for item in category_groups(data))
+    body = render_template('category.html', {'category': esc(category), 'description': esc(descriptions.get(category, 'Curated essentials for everyday living.')), 'count': len(products), 'query': esc(query), 'pills': pills, 'products': ''.join(card(product) for product in products) or '<p class="empty">Nothing found in this collection.</p>'})
+    return layout(data, body)
+
+def search_page(data, query):
+    q = query.get('q', [''])[0].strip().lower()
+    searchable_pages = (('About us', '/about', data['shop'].get('description', '') + data['shop'].get('story_description', '')), ('Delivery information', '/delivery', data['shop'].get('delivery_information', '')), ('Returns and refunds', '/returns', data['shop'].get('return_policy', '')), ('FAQs', '/faq', 'Frequently asked questions'))
+    products = [product for product in data.get('products', []) if q and q in f"{product.get('name', '')} {product.get('brand', '')} {product.get('category', '')} {product.get('subcategory', '')} {product.get('sku', '')} {product.get('description', '')} {' '.join(product.get('tags', []))} {json.dumps(product.get('specifications', {}))} {json.dumps(product.get('variants', []))}".lower()]
+    page_results = ''.join(f'<a class="search-result-link" href="{href}"><b>{label}</b><small>Open page ↗</small></a>' for label, href, content in searchable_pages if q in content.lower())
+    page_results = f'<section class="search-pages"><p class="eyebrow">WEBSITE PAGES</p>{page_results}</section>' if page_results else ''
+    return layout(data, render_template('search.html', {'query': esc(query.get('q', [''])[0]), 'count': len(products), 'results': ''.join(card(product) for product in products) or '<p class="empty">No matching products found.</p>', 'page_results': page_results}))
+
+def categories_page(data):
+    body = f'<main class="catalog category-directory"><p class="eyebrow">SHOP BY CATEGORY</p><h1>Find your <em>collection.</em></h1><p class="hero-text">Explore beauty, home, lifestyle, and everyday essentials.</p><div class="category-grid">{shop_categories(data)}</div></main>'
+    return layout(data, body)
+
+def order_confirmation_page(data, order_number, whatsapp_order_url=''):
+    whatsapp_link = f'<a class="whatsapp-button" href="{esc(whatsapp_order_url)}" target="_blank" rel="noopener">Open WhatsApp to send order ↗</a>' if whatsapp_order_url else ''
+    return layout(data, render_template('order-confirmation.html', {'order_number': esc(order_number), 'whatsapp_link': whatsapp_link}))
+
+def receipt_page(data, order):
+    shop = data.get('shop', {})
+    logo_source = shop.get('logo', '').strip()
+    logo_url = quote(logo_source, safe='/:?&=#')
+    logo = f'<img class="receipt-logo" src="{esc(logo_url)}" alt="{esc(shop.get("name", "Store"))}">' if logo_source and logo_source_available(logo_source) else ''
+    def item_name(item):
+        product = next((product for product in data.get('products', []) if product.get('id') == item.get('product_id')), {})
+        return product.get('name', f'Product #{item.get("product_id", "")}'), product.get('sku', '')
+    item_rows = ''.join(f'<tr><td>{esc(item_name(item)[0])}<small>{esc(item_name(item)[1])}</small></td><td>{item.get("quantity", 1)}</td><td>{money(item.get("unit_price", 0) * item.get("quantity", 1))}</td></tr>' for item in order.get('items', []))
+    return f'''<!doctype html><html><head><meta charset="utf-8"><title>Receipt {esc(order.get("order_number", ""))}</title><style>@page{{size:80mm auto;margin:0}}*{{box-sizing:border-box}}body{{width:80mm;margin:0;padding:7mm 5mm;font:11px/1.4 Arial,sans-serif;color:#1f2924;background:#fff}}.receipt{{width:100%}}.receipt-head{{text-align:center;border-bottom:1px dashed #777;padding-bottom:10px;margin-bottom:10px}}.receipt-logo{{max-width:42mm;max-height:16mm;object-fit:contain;margin-bottom:5px}}h1{{font-size:17px;margin:2px 0}}.muted{{color:#68736b;font-size:10px}}.meta{{border-bottom:1px dashed #777;padding-bottom:8px;margin-bottom:8px}}.meta p{{margin:2px 0}}table{{width:100%;border-collapse:collapse}}th{{text-align:left;font-size:9px;border-bottom:1px solid #333;padding:3px 0}}td{{padding:5px 0;vertical-align:top;border-bottom:1px dotted #bbb}}th:nth-child(2),td:nth-child(2){{text-align:center;width:12mm}}th:last-child,td:last-child{{text-align:right}}td small{{display:block;color:#68736b;font-size:9px}}.totals{{border-top:1px solid #333;margin-top:8px;padding-top:6px}}.total{{font-size:14px;font-weight:700}}.footer{{border-top:1px dashed #777;margin-top:12px;padding-top:8px;text-align:center;font-size:9px}}.print{{display:block;margin:12px auto;padding:8px 12px;background:#3f5548;color:#fff;border:0}}@media print{{.print{{display:none}}}}</style></head><body><main class="receipt"><header class="receipt-head">{logo}<h1>{esc(shop.get("name", "Luxe Beauty Hub"))}</h1><div class="muted">{esc(shop.get("tagline", ""))}</div><div class="muted">{esc(shop.get("phone", ""))} · {esc(shop.get("email", ""))}</div></header><section class="meta"><p><b>Receipt:</b> {esc(order.get("order_number", ""))}</p><p><b>Date:</b> {esc(order.get("created_at", ""))}</p><p><b>Status:</b> {esc(order.get("status", "Pending"))}</p><p><b>Payment:</b> {esc(order.get("payment_method", ""))} · {esc(order.get("payment_status", "Pending"))}</p>{f'<p><b>M-Pesa:</b> {esc(order.get("mpesa_phone", ""))}</p>' if order.get("mpesa_phone") else ''}</section><section class="meta"><p><b>Customer:</b> {esc(order.get("customer_name", "Guest"))}</p><p>{esc(order.get("email", ""))}</p><p>{esc(order.get("phone", ""))}</p><p>{esc(order.get("address", ""))}, {esc(order.get("location", ""))}</p></section><table><thead><tr><th>Item</th><th>Qty</th><th>Amount</th></tr></thead><tbody>{item_rows or '<tr><td colspan="3">Order details available in admin.</td></tr>'}</tbody></table><section class="totals"><p>Subtotal <span style="float:right">{money(order.get("subtotal", order.get("total", 0)))}</span></p><p>Delivery <span style="float:right">{money(order.get("delivery_fee", 0))}</span></p><p class="total">TOTAL <span style="float:right">{money(order.get("total", 0))}</span></p></section><footer class="footer">Thank you for shopping with us.<br>{esc(shop.get("location", ""))}</footer><button class="print" onclick="window.print()">Print receipt</button></main></body></html>'''
+
+def receipt_pdf(data, order):
+    output = io.BytesIO()
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('ReceiptTitle', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=16, textColor=colors.HexColor('#1f2924'), alignment=1, spaceAfter=4)
+    center_style = ParagraphStyle('ReceiptCenter', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#68736b'), alignment=1, leading=12)
+    small_style = ParagraphStyle('ReceiptSmall', parent=styles['Normal'], fontSize=9, leading=12)
+    document = SimpleDocTemplate(output, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm, title=f'Receipt {order.get("order_number", "")}')
+    shop = data.get('shop', {})
+    story = []
+    logo_source = shop.get('logo', '').strip()
+    if logo_source.startswith('/uploads/') and logo_source_available(logo_source):
+        logo_path = ROOT / 'uploads' / Path(unquote(logo_source).removeprefix('/uploads/')).name
+        logo_image = ReportLabImage(str(logo_path), width=42 * mm, height=16 * mm, kind='proportional')
+        logo_image.hAlign = 'CENTER'
+        story.append(logo_image)
+    story.extend([Paragraph(esc(shop.get('name', 'Luxe Beauty Hub')), title_style), Paragraph(esc(shop.get('tagline', '')), center_style), Paragraph(esc(f'{shop.get("phone", "")} · {shop.get("email", "")}'), center_style), Spacer(1, 8)])
+    metadata = [['Receipt', order.get('order_number', '')], ['Date', order.get('created_at', '')], ['Status', order.get('status', 'Pending')], ['Payment', f'{order.get("payment_method", "")} · {order.get("payment_status", "Pending")}'], ['Customer', order.get('customer_name', '')], ['Delivery', f'{order.get("address", "")}, {order.get("location", "")}']]
+    story.append(Table([[Paragraph(esc(str(key)), small_style), Paragraph(esc(str(value)), small_style)] for key, value in metadata], colWidths=[28 * mm, 134 * mm], style=TableStyle([('GRID', (0, 0), (-1, -1), 0.25, colors.HexColor('#d6ddd7')), ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f1f4f0')), ('VALIGN', (0, 0), (-1, -1), 'TOP'), ('PADDING', (0, 0), (-1, -1), 6)])))
+    story.append(Spacer(1, 12))
+    rows = [[Paragraph('<b>Item</b>', small_style), Paragraph('<b>Qty</b>', small_style), Paragraph('<b>Amount</b>', small_style)]]
+    for item in order.get('items', []):
+        product = next((product for product in data.get('products', []) if product.get('id') == item.get('product_id')), {})
+        name = product.get('name', f'Product #{item.get("product_id", "")}')
+        sku = product.get('sku', '')
+        rows.append([Paragraph(esc(f'{name} ({sku})'), small_style), str(item.get('quantity', 1)), money(item.get('unit_price', 0) * item.get('quantity', 1))])
+    story.append(Table(rows, colWidths=[112 * mm, 18 * mm, 32 * mm], style=TableStyle([('LINEBELOW', (0, 0), (-1, 0), 0.7, colors.HexColor('#3f5548')), ('LINEBELOW', (0, 1), (-1, -1), 0.25, colors.HexColor('#d6ddd7')), ('ALIGN', (1, 1), (-1, -1), 'RIGHT'), ('VALIGN', (0, 0), (-1, -1), 'TOP'), ('PADDING', (0, 0), (-1, -1), 6)])))
+    totals = [['Subtotal', money(order.get('subtotal', 0))], ['Discount', f'- {money(order.get("discount", 0))}'], ['Delivery', money(order.get('delivery_fee', 0))], ['Total', money(order.get('total', 0))]]
+    story.extend([Spacer(1, 10), Table(totals, colWidths=[130 * mm, 32 * mm], style=TableStyle([('LINEABOVE', (0, 0), (-1, 0), 0.7, colors.HexColor('#3f5548')), ('ALIGN', (1, 0), (-1, -1), 'RIGHT'), ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'), ('FONTSIZE', (0, -1), (-1, -1), 12), ('PADDING', (0, 0), (-1, -1), 6)])), Spacer(1, 18), Paragraph(esc(f'Thank you for shopping with us. {shop.get("location", "")}'), center_style)])
+    document.build(story)
+    return output.getvalue()
+
+def tracking_page(data, session, order_number=''):
+    orders = [order for order in data.get('orders', []) if order.get('customer_id') == session.get('customer_id')]
+    order = next((item for item in orders if item.get('order_number') == order_number), None) if order_number else (orders[-1] if orders else None)
+    if not order:
+        return info_page(data, 'ORDER TRACKING', 'Your orders, all in one place.', 'Sign in to view the live status of your Luxe order.', '<a class="primary" href="/login">Sign in to continue ↗</a>')
+    delivery_status = order.get('delivery_status', order.get('status', 'Pending'))
+    delivered_at = f'<div class="checkout-row"><span>Delivered</span><b>{esc(order.get("delivered_at", ""))}</b></div>' if order.get('delivered_at') else ''
+    body = f'<div class="tracking-card"><div class="checkout-row"><span>Order</span><b>{esc(order.get("order_number", ""))}</b></div><div class="checkout-row"><span>Order status</span><b>{esc(order.get("status", "Pending"))}</b></div><div class="checkout-row"><span>Delivery status</span><b>{esc(delivery_status)}</b></div>{delivered_at}<div class="checkout-row"><span>Total</span><b>{money(order.get("total", 0))}</b></div><div class="checkout-row"><span>Delivery</span><b>{esc(order.get("location", order.get("address", "")))}</b></div></div>'
+    return info_page(data, 'ORDER TRACKING', 'Your order is on its way.', 'Follow each step from confirmation to delivery.', body)
+
+def login_page(data, error=''):
+    error_html = f'<p class="notice">{esc(error)}</p>' if error else ''
+    body = render_template('login.html', {'shop_name': esc(data['shop']['name']), 'error': error_html})
+    return layout(data, body)
+
+def register_page(data, error=''):
+    error_html = f'<p class="notice">{esc(error)}</p>' if error else ''
+    body = render_template('register.html', {'shop_name': esc(data['shop']['name']), 'error': error_html})
+    return layout(data, body)
+
+def current_account(data, session):
+    email = session.get('email', '').lower()
+    records = data.get('users', []) + data.get('customers', [])
+    return next((record for record in records if record.get('email', '').lower() == email), None)
+
+def account_page(data, session, message='', orders_view=False):
+    account = current_account(data, session)
+    if not account: return login_page(data, 'Please sign in to view your account.')
+    orders = [o for o in data.get('orders', []) if o.get('customer_id') == account.get('id')]
+    order_rows = ''.join(f'<div class="checkout-row"><span><a class="under" href="/tracking?order={esc(o["order_number"])}">{esc(o["order_number"])}</a><small class="muted-line">{esc(o["status"])} · {esc(o["created_at"])}</small><a class="under" href="/receipt?order={esc(o["order_number"])}">Download receipt</a></span><b>{money(o["total"])}</b></div>' for o in orders) or '<p class="empty">No orders yet.</p>'
+    notice = f'<p class="notice">{esc(message)}</p>' if message else ''
+    profile_class = 'active' if not orders_view else ''
+    orders_class = 'active' if orders_view else ''
+    orders_heading = 'My orders' if orders_view else 'Order tracking'
+    return layout(data, f'''<main class="account-page"><section><p class="eyebrow">MY ACCOUNT</p><h1>Hello, <em>{esc(account.get('name', 'Customer'))}.</em></h1>{notice}<div class="account-nav"><a class="{profile_class}" href="/account">Profile</a><a class="{orders_class}" href="/account/orders#orders">My orders</a><a href="/wishlist">Wishlist</a><a href="/logout">Sign out</a></div><div class="account-grid"><section class="panel"><h2>Your details</h2><form method="post" class="checkout-form"><input type="hidden" name="action" value="account_update"><label>Name<input name="name" value="{esc(account.get('name', ''))}" required></label><label>Email<input value="{esc(account.get('email', ''))}" type="email" readonly></label><label>Phone<input name="phone" value="{esc(account.get('phone', ''))}"></label><button class="primary">Save details</button></form></section><section class="panel"><h2>Change password</h2><form method="post" class="checkout-form"><input type="hidden" name="action" value="account_password"><label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label><label>New password<input name="new_password" type="password" minlength="8" autocomplete="new-password" required></label><label>Confirm new password<input name="confirm_password" type="password" minlength="8" autocomplete="new-password" required></label><button class="primary">Change password</button></form></section></div><div class="panel account-orders" id="orders"><h2>{orders_heading}</h2><p class="hero-text">Track every order from confirmation to delivery.</p>{order_rows}</div></section></main>''')
+
+def admin_orders(data, message=''):
+    rows = ''.join(f'''<div class="table-row"><span><b>{esc(order['order_number'])}</b><small>{esc(order.get('customer_name', 'Guest'))} · {esc(order.get('email', ''))}</small><small>{esc(order.get('phone', ''))} · {esc(order.get('location', ''))}</small><small>{esc(order.get('address', ''))}</small>{f'<small>M-Pesa: {esc(order.get("mpesa_phone", ""))}</small>' if order.get('mpesa_phone') else ''}<a class="under" href="/receipt?order={esc(order['order_number'])}">Download receipt</a></span><span>{money(order['total'])}</span><span>{esc(order.get('payment_method', 'Pending'))}<small>{esc(order.get('payment_status', 'Pending'))}</small></span><span><form method="post"><input type="hidden" name="action" value="order_status"><input type="hidden" name="order_number" value="{esc(order['order_number'])}"><select name="status">{''.join(f'<option {"selected" if status == order.get("status") else ""}>{status}</option>' for status in ORDER_STATUSES)}</select><button>Save</button></form></span></div>''' for order in reversed(data.get('orders', []))) or '<p class="empty">No orders have been placed yet.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content"><p class="eyebrow">ADMIN PANEL / ORDERS</p><h1>Order <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><p class="note">Customer contact, M-Pesa number, delivery address, payment method, and payment status are shown on each order.</p><div class="table"><div class="table-row table-head"><span>Order / Customer</span><span>Total</span><span>Payment</span><span>Order status</span></div>{rows}</div></section></section></main>''')
+
+def promotions_page(data, message=''):
+    coupons = ''.join(f'''<div class="checkout-row"><span><b>{esc(c["code"])}</b> · {c["type"]}<small class="muted-line">{c.get("used", 0)} / {c.get("usage_limit", "∞")} uses · {"Active" if c.get("active", True) else "Disabled"}</small></span><b>{c["value"]}% off</b><span><form method="post" class="inline-form"><input type="hidden" name="action" value="coupon_toggle"><input type="hidden" name="code" value="{esc(c["code"])}"><button>{"Disable" if c.get("active", True) else "Activate"}</button></form><form method="post" class="inline-form"><input type="hidden" name="action" value="coupon_delete"><input type="hidden" name="code" value="{esc(c["code"])}"><button onclick="return confirm('Delete this coupon?')">Delete</button></form></span></div>''' for c in data.get('coupons', []))
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / MARKETING</p><h1>Coupons & <em>promotions.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><h2>Active coupons</h2>{coupons or '<p class="empty">No coupons yet.</p>'}<form method="post" class="checkout-form"><input type="hidden" name="action" value="coupon"><label>Coupon code<input name="code" placeholder="SAVE20" required></label><label>Percentage discount<input name="value" type="number" min="1" max="100" required></label><label>Usage limit<input name="usage_limit" type="number" min="1" value="100" required></label><button class="primary">Create coupon ↗</button></form></section></section></main>''')
+
+def admin_reviews(data, message=''):
+    rows = ''.join(f'''<div class="review admin-review"><b>{esc(review.get('customer_name', 'Customer'))} · {'★' * int(review.get('rating', 5))}</b><p>{esc(review.get('text', ''))}</p><small>{esc(review.get('created_at', ''))}</small><form method="post"><input type="hidden" name="action" value="review_moderate"><input type="hidden" name="review_id" value="{review['id']}"><button name="decision" value="approve">Approve</button><button name="decision" value="hide">Hide</button><button name="decision" value="delete">Delete</button></form></div>''' for review in data.get('reviews', [])) or '<p class="empty">No reviews waiting for moderation.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PRODUCTS / REVIEWS</p><h1>Review <em>moderation.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel">{rows}</section></section></main>''')
+
+def admin_customers(data, message=''):
+    rows = ''
+    for customer in data.get('customers', []):
+        order_count = len([order for order in data.get('orders', []) if order.get('customer_id') == customer['id']])
+        status = 'Active' if customer.get('active', True) else 'Disabled'
+        action = 'Disable' if customer.get('active', True) else 'Activate'
+        rows += f'<div class="table-row"><span><b>{esc(customer["name"])}</b><small>{esc(customer["email"])} · {esc(customer.get("phone", ""))}</small></span><span>{order_count} orders</span><span>{status}</span><span><form method="post"><input type="hidden" name="action" value="customer_toggle"><input type="hidden" name="customer_id" value="{customer["id"]}"><button>{action}</button></form></span></div>'
+    rows = rows or '<p class="empty">No customers yet.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / CUSTOMERS</p><h1>Customer <em>directory.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Customer</span><span>Orders</span><span>Status</span><span>Action</span></div>{rows}</div></section></section></main>''')
+
+def admin_payments(data, message=''):
+    rows = ''.join(f'<div class="table-row"><span>{esc(order.get("order_number", ""))}<small>{esc(order.get("customer_name", "Guest"))} · {esc(order.get("email", ""))}</small><small>{esc(order.get("phone", ""))} · {esc(order.get("mpesa_phone", ""))}</small><a class="under" href="/receipt?order={esc(order.get("order_number", ""))}">Download receipt</a></span><span>{money(order.get("total", 0))}</span><span>{esc(order.get("payment_method", "Pending"))}</span><span><form method="post"><input type="hidden" name="action" value="payment_status"><input type="hidden" name="order_number" value="{esc(order["order_number"])}"><select name="payment_status"><option>Pending</option><option>Paid</option><option>Failed</option><option>Refunded</option></select><button>Save</button></form></span></div>' for order in reversed(data.get('orders', []))) or '<p class="empty">No payments yet.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PAYMENTS</p><h1>Payment <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Order</span><span>Total</span><span>Method</span><span>Status</span></div>{rows}</div></section></section></main>''')
+
+def admin_deliveries(data, message=''):
+    rows = ''.join(f'<div class="table-row"><span>{esc(order.get("order_number", ""))}<small>{esc(order.get("customer_name", "Guest"))} · {esc(order.get("location", ""))}</small></span><span>{esc(order.get("address", ""))}</span><span><form method="post"><input type="hidden" name="action" value="delivery_status"><input type="hidden" name="order_number" value="{esc(order["order_number"])}"><select name="delivery_status"><option>Pending</option><option>Ready for Delivery</option><option>Shipped</option><option>Delivered</option><option>Returned</option></select><button>Save</button></form></span></div>' for order in reversed(data.get('orders', []))) or '<p class="empty">No deliveries yet.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / DELIVERIES</p><h1>Delivery <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Order</span><span>Address</span><span>Status</span></div>{rows}</div></section></section></main>''')
+
+def admin_audit_logs(data):
+    rows = ''.join(f'<div class="table-row"><span>{esc(log.get("date", ""))}</span><span>{esc(log.get("user", "Admin"))}</span><span>{esc(log.get("action", ""))}</span><span>{esc(log.get("description", ""))}</span></div>' for log in reversed(data.get('audit_logs', []))) or '<p class="empty">No audit events recorded.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SECURITY</p><h1>Audit <em>logs.</em></h1><section class="panel"><div class="table"><div class="table-row table-head"><span>Date</span><span>User</span><span>Action</span><span>Description</span></div>{rows}</div></section></section></main>''')
+
+def admin_staff(data, message=''):
+    rows = ''.join(f'<div class="table-row"><span>{esc(user.get("name", ""))}<small>{esc(user.get("email", ""))}</small></span><span>{esc(user.get("role", "STAFF"))}</span><span>{"Active" if user.get("active", True) else "Disabled"}</span><span><form method="post"><input type="hidden" name="action" value="staff_toggle"><input type="hidden" name="staff_id" value="{user.get("id", 0)}"><button>{"Disable" if user.get("active", True) else "Activate"}</button></form></span></div>' for user in data.get('users', []))
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / STAFF</p><h1>Staff <em>accounts.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Name</span><span>Role</span><span>Status</span></div>{rows}</div><form method="post" class="checkout-form"><input type="hidden" name="action" value="staff_create"><label>Name<input name="staff_name" required></label><label>Email<input name="staff_email" type="email" required></label><label>Temporary password<input name="staff_password" type="password" required></label><label>Role<select name="staff_role"><option>STAFF</option><option>MANAGER</option><option>ADMIN</option></select></label><button class="primary">Create staff account</button></form></section></section></main>''')
+
+def admin_restore(data, message=''):
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / DATABASE</p><h1>Restore a <em>backup.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="restore"><label>Backup JSON file<input name="backup_file" type="file" accept=".json,application/json" required></label><button class="primary" onclick="return confirm('Restore this database backup?')">RESTORE DATABASE</button></form><small class="note">Restoring replaces the current application state with the selected validated JSON backup.</small></section></section></main>''')
+
+def admin_products(data, message=''):
+    fields = [('name', 'Product name'), ('sku', 'SKU'), ('brand', 'Brand'), ('price', 'Selling price'), ('discount_price', 'Original price'), ('stock', 'Stock'), ('minimum_stock', 'Minimum stock')]
+    controls = ''.join(f'<label>{label}<input name="{key}" type="number" step="0.01" {"required" if key in ("price", "stock") else ""}></label>' if key in ('price', 'discount_price', 'stock', 'minimum_stock') else f'<label>{label}<input name="{key}" {"required" if key in ("name", "sku") else ""}></label>' for key, label in fields)
+    controls += f'<label>Category<select name="category" required><option value="">Select category</option>{category_options(data)}</select></label><label>Subcategory<select name="subcategory" required><option value="">Select subcategory</option>{subcategory_options(data)}</select></label>'
+    controls += '<label>Product images (JPG, JPEG, PNG, WEBP)<input id="image-file" name="image_file" type="file" accept=".jpg,.jpeg,.png,.webp" multiple required><small class="note">The first image is primary. Maximum 5 MB per image.</small></label><label>Variants<small class="note">One per line: Name | Price | Stock</small><textarea name="variants" placeholder="50ml | 12400 | 8"></textarea></label>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PRODUCTS</p><h1>Add a <em>product.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="product_create">{controls}<label>Description<textarea name="description"></textarea></label><label>Tags<input name="tags" placeholder="gift, new, featured"></label><button class="primary">SAVE PRODUCT ↗</button><a class="under" href="/admin">Cancel</a></form></section></section></main>''')
+
+def admin_product_edit(data, product, message=''):
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PRODUCTS / EDIT</p><h1>Edit <em>{esc(product['name'])}.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="product_update"><input type="hidden" name="product_id" value="{product['id']}"><label>Product name<input name="name" value="{esc(product['name'])}" required></label><label>SKU<input name="sku" value="{esc(product.get('sku', ''))}" required></label><label>Brand<input name="brand" value="{esc(product.get('brand', ''))}"></label><label>Selling price (KSh)<input name="price" type="number" step="0.01" value="{product['price']}" required></label><label>Original price (KSh)<input name="discount_price" type="number" step="0.01" value="{product.get('old_price') or ''}"></label><label>Stock<input name="stock" type="number" value="{product['stock']}" required></label><label>Minimum stock<input name="minimum_stock" type="number" value="{product.get('minimum_stock', 5)}"></label><label>Category<select name="category" required>{category_options(data, product.get('category', ''))}</select></label><label>Subcategory<select name="subcategory" required>{subcategory_options(data, product.get('subcategory', ''))}</select></label><label>Product image<input id="image-file" name="image_file" type="file" accept=".jpg,.jpeg,.png,.webp"><img id="image-preview" class="upload-preview" src="{esc(product.get('image', ''))}" alt="Product preview"></label><label>Description<textarea name="description">{esc(product.get('description', ''))}</textarea></label><label>Tags<input name="tags" value="{esc(', '.join(product.get('tags', [])))}"></label><button class="primary">SAVE PRODUCT CHANGES ✓</button><a class="under" href="/admin">Cancel</a></form></section></section><script>document.querySelector('#image-file').onchange=event=>document.querySelector('#image-preview').src=URL.createObjectURL(event.target.files[0]);</script></main>''')
+
+def category_manager(data, message=''):
+    groups = ''.join(f'<fieldset><legend>{esc(category)}</legend><textarea name="category_{index}" rows="{max(4, len(subcategories))}" aria-label="{esc(category)} subcategories">{esc("\n".join(subcategories))}</textarea><small class="note">One subcategory per line.</small></fieldset>' for index, (category, subcategories) in enumerate(category_groups(data).items()))
+    names = ''.join(f'<input type="hidden" name="name_{index}" value="{esc(category)}">' for index, category in enumerate(category_groups(data)))
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / CATALOGUE / CATEGORIES</p><h1>Product <em>categories.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<p class="hero-text">Manage the approved category hierarchy used by product entry and storefront filters.</p><form method="post" class="branding-form category-manager"><input type="hidden" name="action" value="categories_save">{names}{groups}<button class="primary">Save category hierarchy ✓</button></form></section></main>''')
+
+def report_csv(data, report):
+    output = io.StringIO(newline='')
+    writer = csv.writer(output)
+    def safe(value):
+        text = str(value or '')
+        return "'" + text if text[:1] in ('=', '+', '-', '@') else text
+    if report == 'customers':
+        writer.writerow(['Customer', 'Email', 'Orders', 'Total spending'])
+        for customer in data.get('customers', []):
+            orders = [order for order in data.get('orders', []) if order.get('customer_id') == customer['id']]
+            writer.writerow([safe(customer.get('name')), safe(customer.get('email')), len(orders), sum(order.get('total', 0) for order in orders)])
+    elif report == 'inventory':
+        writer.writerow(['Product', 'SKU', 'Stock', 'Status'])
+        for product in data['products']:
+            status = 'OUT OF STOCK' if not product['stock'] else 'LOW STOCK' if product['stock'] <= 5 else 'IN STOCK'
+            writer.writerow([safe(product.get('name')), safe(product.get('sku')), product['stock'], status])
+    else:
+        writer.writerow(['Order', 'Customer', 'Status', 'Payment', 'Total', 'Date'])
+        for order in data.get('orders', []):
+            writer.writerow([safe(order.get('order_number')), safe(order.get('customer_name')), order.get('status'), safe(order.get('payment_method')), order.get('total'), order.get('created_at')])
+    return output.getvalue()
+
+def wishlist_page(data, session):
+    ids = data.get('wishlists', {}).get(str(session.get('customer_id', session.get('token', 'guest'))), [])
+    products = [p for p in data['products'] if p['id'] in ids]
+    return layout(data, f'''<main class="catalog wishlist-page"><p class="eyebrow">SAVED FOR LATER</p><h1>Your <em>wishlist.</em></h1><div class="product-grid">{''.join(card(p) for p in products) or '<p class="empty">Your wishlist is empty.</p>'}</div></main>''')
+
+def logo_source_available(image):
+    image = (image or '').strip()
+    if image.startswith(('https://', 'http://')):
+        return True
+    if image.startswith('/uploads/'):
+        return (ROOT / 'uploads' / Path(image).name).is_file()
+    return False
+
+def branding_settings(data, message=''):
+    shop = data['shop']
+    textarea_keys = {'description', 'delivery_information', 'return_policy', 'privacy_policy', 'terms', 'story_description', 'newsletter_description'}
+
+    def field(key, label):
+        if key in textarea_keys:
+            control = f'<textarea name="{key}">{esc(shop.get(key, ""))}</textarea>'
+        else:
+            control = f'<input name="{key}" value="{esc(shop.get(key, ""))}">' 
+        return f'<label>{label}{control}</label>'
+
+    def section(title, fields):
+        return f'<section class="settings-section"><h2>{title}</h2>{"".join(field(key, label) for key, label in fields)}</section>'
+
+    controls = section('Store information', [('name','Shop name'),('tagline','Tagline'),('description','Description'),('phone','Phone'),('whatsapp','WhatsApp'),('email','Email'),('location','Physical location'),('business_hours','Business hours'),('country','Country'),('currency','Currency'),('delivery_fee','Delivery fee'),('free_delivery_threshold','Free delivery threshold'),('order_prefix','Order number prefix')])
+    controls += f'<section class="settings-section"><h2>Brand assets</h2><label>Logo file<input name="logo_file" type="file" accept="image/*"><small class="note">Upload any image format, maximum 5 MB.</small></label><label>Favicon URL<input name="favicon" value="{esc(shop.get("favicon", ""))}"></label>{f'<img class="settings-logo-preview" src="{esc(shop.get("logo", ""))}" alt="Current logo">' if logo_source_available(shop.get("logo", "")) else ""}</section>'
+    controls += section('Policies', [('delivery_information','Delivery information'),('return_policy','Return policy'),('privacy_policy','Privacy policy'),('terms','Terms and conditions')])
+    controls += section('Brand story', [('story_heading','Brand story heading'),('story_description','Brand story description'),('newsletter_heading','Newsletter heading'),('newsletter_description','Newsletter description')])
+    social_fields = ''.join(f'<label>{label}<input name="social_{key}" value="{esc(shop.get("social", {}).get(key, ""))}"></label>' for key, label in (('instagram', 'Instagram URL'), ('facebook', 'Facebook URL'), ('tiktok', 'TikTok URL'), ('x', 'X URL'), ('youtube', 'YouTube URL')))
+    controls += f'<section class="settings-section"><h2>Social links</h2>{social_fields}</section>'
+    integrations = data.setdefault('integrations', {})
+    mpesa_fields = ''.join(f'<label>{label}<input name="mpesa_{key}" type="{"password" if "secret" in key or key == "passkey" else "text"}" value="{esc(integrations.get(f"mpesa_{key}", "")) if "secret" not in key and key != "passkey" else ""}" placeholder="{"Configured" if integrations.get(f"mpesa_{key}") and ("secret" in key or key == "passkey") else ""}"></label>' for key, label in (('environment', 'Environment'), ('shortcode', 'Shortcode'), ('consumer_key', 'Consumer key'), ('consumer_secret', 'Consumer secret'), ('passkey', 'Passkey'), ('callback_url', 'Callback URL')))
+    smtp_fields = ''.join(f'<label>{label}<input name="smtp_{key}" type="{"password" if key == "password" else "text"}" value="{esc(integrations.get(f"smtp_{key}", "")) if key != "password" else ""}" placeholder="{"Configured" if key == "password" and integrations.get("smtp_password") else ""}"></label>' for key, label in (('host', 'SMTP host'), ('port', 'SMTP port'), ('user', 'SMTP username'), ('password', 'SMTP password'), ('from', 'From address')))
+    controls += f'<section class="settings-section"><h2>Integrations</h2><h3>M-Pesa</h3>{mpesa_fields}<h3>SMTP email</h3>{smtp_fields}</section>'
+    backup_schedule = shop.get('backup_schedule', 'disabled')
+    backup_day = shop.get('backup_day', 'Sunday')
+    controls += f'<section class="settings-section"><h2>Database backups</h2><label>Automatic backup schedule<select name="backup_schedule"><option value="disabled" {"selected" if backup_schedule == "disabled" else ""}>Disabled</option><option value="daily" {"selected" if backup_schedule == "daily" else ""}>Daily</option><option value="weekly" {"selected" if backup_schedule == "weekly" else ""}>Weekly</option></select></label><label>Backup time<input name="backup_time" type="time" value="{esc(shop.get("backup_time", "02:00"))}"></label><label>Backup day<select name="backup_day">{''.join(f'<option {"selected" if backup_day == day else ""}>{day}</option>' for day in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))}</select></label><label>Keep recent backups<input name="backup_retention" type="number" min="1" max="100" value="{esc(shop.get("backup_retention", 7))}"></label><small class="note">Backups are written to the server backups folder. Keep an off-server copy for disaster recovery.</small></section>'
+    theme = f'<label>Default theme<select name="default_theme"><option value="system" {"selected" if shop.get("default_theme", "system") == "system" else ""}>Use device preference</option><option value="light" {"selected" if shop.get("default_theme") == "light" else ""}>Light</option><option value="dark" {"selected" if shop.get("default_theme") == "dark" else ""}>Dark</option></select></label>'
+    hero = shop.setdefault('hero', {})
+    hero_fields = ''.join(f'<label>Hero {label}<input name="hero_{key}" value="{esc(hero.get(key, ""))}"></label>' for key, label in (('heading', 'heading'), ('image', 'image URL'), ('primary_label', 'primary button label'), ('primary_link', 'primary button link'), ('secondary_label', 'secondary button label'), ('secondary_link', 'secondary button link')))
+    controls += f'<section class="settings-section"><h2>Homepage hero</h2>{hero_fields}<label>Hero description<textarea name="hero_description">{esc(hero.get("description", ""))}</textarea></label>{theme}</section>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SETTINGS / SHOP INFORMATION</p><h1>Shop <em>branding.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="branding">{controls}<button class="primary">Save branding changes ✓</button></form></section></main>''', 'Shop branding settings')
+
+class Store(BaseHTTPRequestHandler):
+    def send_error(self, code, message=None, explain=None):
+        labels = {403: 'Access denied', 404: 'Page not found', 413: 'Request too large', 429: 'Too many requests', 500: 'Something went wrong'}
+        body = layout(read_db(), f'<main class="empty"><h1>{labels.get(code, "Request error")}</h1><p>{esc(message or "Please try again later.")}</p><a class="primary" href="/">Return home</a></main>')
+        self.send_response(code)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def rate_limited(self):
+        now = time.time(); address = self.client_address[0]
+        with RATE_LIMIT_LOCK:
+            recent = [stamp for stamp in RATE_LIMIT.get(address, []) if now - stamp < 60]
+            recent.append(now)
+            RATE_LIMIT[address] = recent[-121:]
+            return len(recent) > 120
+
+    def session(self):
+        now = time.time()
+        cookies = SimpleCookie(self.headers.get('Cookie', ''))
+        token = cookies.get('luxe_session')
+        current = SESSIONS.get(token.value) if token else None
+        expired = current and (now - current.get('last_seen', now) > SESSION_IDLE_SECONDS or now - current.get('created_at', now) > SESSION_MAX_SECONDS)
+        if not token or not current or expired:
+            if token: SESSIONS.pop(token.value, None)
+            self.session_token = secrets.token_urlsafe(18)
+            SESSIONS[self.session_token] = {'cart': [], 'created_at': now, 'last_seen': now}
+        else:
+            self.session_token = token.value
+            current['last_seen'] = now
+        return SESSIONS[self.session_token]
+
+    def csrf_token(self, session):
+        session.setdefault('csrf', secrets.token_urlsafe(24))
+        return session['csrf']
+
+    def secure_cookie(self):
+        forwarded_proto = self.headers.get('X-Forwarded-Proto', '').split(',', 1)[0].strip().lower()
+        return os.environ.get('APP_ENV') == 'production' and forwarded_proto == 'https'
+
+    def do_PUT(self):
+        if not self.path.startswith('/api/products/'):
+            return send_json(self, {'error': 'Not found'}, 404)
+        session = self.session()
+        if not session.get('admin'): return send_json(self, {'error': 'Admin sign-in required'}, 403)
+        length = int(self.headers.get('Content-Length', 0)); raw = self.rfile.read(min(length, MAX_REQUEST_BYTES))
+        try: updates = json.loads(raw.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError): return send_json(self, {'error': 'Invalid JSON'}, 400)
+        data = read_db(); identifier = self.path.rstrip('/').rsplit('/', 1)[-1]; product = next((item for item in data.get('products', []) if str(item.get('id')) == identifier), None)
+        if not product: return send_json(self, {'error': 'Product not found'}, 404)
+        for key in ('name', 'sku', 'brand', 'category', 'subcategory', 'description', 'image'):
+            if key in updates: product[key] = str(updates[key]).strip()
+        for key in ('price', 'old_price', 'stock', 'minimum_stock'):
+            if key in updates: product[key] = float(updates[key]) if key in ('price', 'old_price') else int(updates[key])
+        audit(data, session, 'product_update', f'{product["name"]} updated via API'); write_db(data); return send_json(self, product)
+
+    def do_DELETE(self):
+        if not self.path.startswith('/api/products/'):
+            return send_json(self, {'error': 'Not found'}, 404)
+        session = self.session()
+        if not session.get('admin'): return send_json(self, {'error': 'Admin sign-in required'}, 403)
+        data = read_db(); identifier = self.path.rstrip('/').rsplit('/', 1)[-1]; product = next((item for item in data.get('products', []) if str(item.get('id')) == identifier), None)
+        if not product: return send_json(self, {'error': 'Product not found'}, 404)
+        data['products'].remove(product); audit(data, session, 'product_delete', f'{product["name"]} deleted via API'); write_db(data); return send_json(self, {'deleted': product['id']})
+
+    def do_GET(self):
+        if self.rate_limited(): return self.send_error(429, 'Please slow down and try again.')
+        parsed = urlparse(self.path); data = read_db(); session = self.session()
+        if session.get('customer_id') and not session.get('admin') and session.get('email'):
+            legacy_user = next((item for item in data.get('users', []) if item.get('email', '').lower() == session.get('email', '').lower() and is_admin_role(item.get('role'))), None)
+            if legacy_user:
+                session['role'] = legacy_user.get('role', 'CUSTOMER')
+                session['admin'] = is_admin_role(session['role'])
+        requested_theme = parse_qs(parsed.query).get('theme', [session.get('theme', data.get('shop', {}).get('default_theme', 'system'))])[0]
+        session['theme'] = requested_theme if requested_theme in ('light', 'dark', 'system') else 'system'
+        data['_theme'] = session['theme']
+        authenticated = bool(session.get('customer_id'))
+        data['_cart_count'] = sum(item.get('quantity', 0) for item in session.get('cart', [])) if authenticated else 0
+        wishlist_key = str(session.get('customer_id')) if authenticated else ''
+        data['_wishlist_count'] = len(data.get('wishlists', {}).get(wishlist_key, [])) if authenticated else 0
+        data['_account_link'] = '/account' if authenticated else '/login'
+        data['_wishlist_link'] = '/wishlist' if authenticated else '/login?message=Please+sign+in+to+view+your+wishlist'
+        data['_cart_link'] = '/cart' if authenticated else '/login?message=Please+sign+in+to+view+your+bag'
+        data['_auth_link'] = '<a href="/logout" aria-label="Sign out" title="Sign out">↪<span>Sign out</span></a>' if authenticated else ''
+        data['_is_admin'] = bool(session.get('admin'))
+        data['_admin_role'] = session.get('role')
+        if parsed.path == '/styles.css':
+            self.send_response(200); self.send_header('Content-Type','text/css'); self.end_headers(); self.wfile.write((ROOT/'styles.css').read_bytes()); return
+        if parsed.path == '/robots.txt':
+            self.send_response(200); self.send_header('Content-Type', 'text/plain; charset=utf-8'); self.end_headers(); self.wfile.write(b'User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /api\nSitemap: /sitemap.xml\n'); return
+        if parsed.path == '/sitemap.xml':
+            urls = ['<url><loc>http://localhost:8000/</loc></url>'] + [f'<url><loc>http://localhost:8000/product?id={product["id"]}</loc></url>' for product in data.get('products', [])]
+            body = ('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + ''.join(urls) + '</urlset>').encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/xml'); self.end_headers(); self.wfile.write(body); return
+        if parsed.path.startswith('/uploads/'):
+            filename = Path(unquote(parsed.path.removeprefix('/uploads/'))).name; target = ROOT / 'uploads' / filename
+            if not target.is_file(): return self.send_error(404, 'Image not found.')
+            self.send_response(200); self.send_header('Content-Type', 'image/' + target.suffix.lower().removeprefix('.')); self.send_header('Cache-Control', 'public, max-age=86400'); self.end_headers(); self.wfile.write(target.read_bytes()); return
+        message = parse_qs(parsed.query).get('message',[''])[0]
+        params = parse_qs(parsed.query)
+        if parsed.path == '/api/categories': return send_json(self, [{'name': name, 'subcategories': subcategories} for name, subcategories in category_groups(data).items()])
+        if parsed.path == '/api/settings': return send_json(self, data.get('shop', {}))
+        if parsed.path == '/api/products':
+            page = max(1, int(params.get('page', ['1'])[0])); per_page = min(100, max(1, int(params.get('per_page', ['24'])[0])))
+            search = params.get('q', [''])[0].lower(); category = params.get('category', [''])[0]; brand = params.get('brand', [''])[0]
+            products = [product for product in data.get('products', []) if (not search or search in f'{product.get("name", "")} {product.get("brand", "")} {product.get("sku", "")}'.lower()) and (not category or product.get('category') == category) and (not brand or product.get('brand') == brand) and product.get('active', True)]
+            start = (page - 1) * per_page
+            return send_json(self, {'items': products[start:start + per_page], 'page': page, 'per_page': per_page, 'total': len(products)})
+        if parsed.path.startswith('/api/products/'):
+            identifier = parsed.path.rsplit('/', 1)[-1]
+            product = next((product for product in data.get('products', []) if str(product.get('id')) == identifier or product_slug(product) == identifier), None)
+            return send_json(self, product or {'error': 'Product not found'}, 200 if product else 404)
+        if parsed.path == '/api/orders':
+            if not session.get('admin'): return send_json(self, {'error': 'Admin sign-in required'}, 403)
+            return send_json(self, data.get('orders', []))
+        if parsed.path == '/admin' and not session.get('admin'):
+            body = login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin': body = admin(data, message)
+        elif parsed.path == '/admin/settings': body = branding_settings(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/orders': body = admin_orders(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/payments': body = admin_payments(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/deliveries': body = admin_deliveries(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/promotions': body = promotions_page(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/reviews': body = admin_reviews(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/customers': body = admin_customers(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/products': body = admin_products(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/products/edit':
+            product = next((p for p in data['products'] if str(p['id']) == params.get('id', [''])[0]), None)
+            body = login_page(data, 'Admin sign-in required.') if not session.get('admin') else admin_product_edit(data, product, message) if product else layout(data, '<main class="empty"><h1>Product not found</h1><a class="primary" href="/admin">Return to admin</a></main>')
+        elif parsed.path == '/admin/categories': body = category_manager(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/audit': body = admin_audit_logs(data) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/staff': body = admin_staff(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/restore': body = admin_restore(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/backup':
+            if not session.get('admin'): body = login_page(data, 'Admin sign-in required.')
+            else:
+                backup = json.dumps(read_db(), ensure_ascii=False, indent=2).encode(); self.send_response(200); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Disposition', 'attachment; filename=luxe-backup.json'); self.end_headers(); self.wfile.write(backup); return
+        elif parsed.path == '/admin/reports' and session.get('admin'):
+            report = params.get('type', ['orders'])[0]
+            body = layout(data, f'<main class="admin-page"><section class="admin-content"><p class="eyebrow">ADMIN PANEL / REPORTS</p><h1>Business <em>reports.</em></h1><p class="hero-text">Export operational data for reconciliation and planning.</p><a class="primary" href="/admin/reports.csv?type={esc(report)}">Download CSV ↗</a></section></main>')
+        elif parsed.path == '/admin/reports.csv' and session.get('admin'):
+            csv = report_csv(data, params.get('type', ['orders'])[0]); self.send_response(200); self.send_header('Content-Type', 'text/csv'); self.send_header('Content-Disposition', 'attachment; filename=report.csv'); self.end_headers(); self.wfile.write(csv.encode()); return
+        elif parsed.path == '/login': body = login_page(data, message)
+        elif parsed.path == '/forgot-password': body = forgot_password_page(data, message)
+        elif parsed.path == '/reset-password': body = reset_password_page(data, params.get('email', [''])[0], message)
+        elif parsed.path == '/register': body = register_page(data, message)
+        elif parsed.path in ('/account', '/account/orders'): body = account_page(data, session, message, parsed.path == '/account/orders')
+        elif parsed.path == '/tracking': body = tracking_page(data, session, params.get('order', [''])[0]) if session.get('customer_id') else login_page(data, 'Please sign in to track your orders.')
+        elif parsed.path == '/wishlist': body = wishlist_page(data, session) if authenticated else login_page(data, 'Please sign in to view your wishlist.')
+        elif parsed.path == '/logout':
+            session.clear(); session['cart'] = []; body = login_page(data, 'You have been signed out.')
+        elif parsed.path == '/product':
+            product = next((p for p in data['products'] if str(p['id']) == params.get('id', [''])[0]), None)
+            body = product_page(data, product, session) if product else layout(data, '<main class="empty"><h1>Product not found</h1></main>')
+        elif parsed.path.startswith('/shop/'):
+            product = next((p for p in data['products'] if product_slug(p) == parsed.path.rstrip('/').rsplit('/', 1)[-1]), None)
+            body = product_page(data, product, session) if product else layout(data, '<main class="empty"><h1>Product not found</h1></main>')
+        elif parsed.path == '/cart': body = cart_page(data, session) if authenticated else login_page(data, 'Please sign in to view your bag.')
+        elif parsed.path == '/checkout': body = checkout_page(data, session, message, params.get('payment', [''])[0] == 'whatsapp') if session.get('customer_id') else login_page(data, 'Please sign in or create an account before placing an order.')
+        elif parsed.path == '/receipt':
+            order_number = params.get('order', [''])[0]
+            order = next((item for item in data.get('orders', []) if item.get('order_number') == order_number), None)
+            owns_order = order and (session.get('admin') or order.get('customer_id') == session.get('customer_id'))
+            if not owns_order:
+                return self.send_error(404, 'Receipt not found.')
+            receipt = receipt_pdf(data, order)
+            self.send_response(200); self.send_header('Content-Type', 'application/pdf'); self.send_header('Content-Disposition', f'attachment; filename=receipt-{order_number}.pdf'); self.send_header('Content-Length', str(len(receipt))); self.send_header('Cache-Control', 'no-store'); self.end_headers(); self.wfile.write(receipt); return
+        elif parsed.path == '/order-confirmation': body = order_confirmation_page(data, params.get('order', [''])[0], session.pop('whatsapp_order_url', '')) if params.get('order', [''])[0] else info_page(data, 'ORDER CONFIRMATION', 'Thank you for your order.', 'Your order has been received.', '<a class="primary" href="/account/orders">View my orders ↗</a>')
+        elif parsed.path == '/search': body = search_page(data, params)
+        elif parsed.path == '/shop': body = home(data, params)
+        elif parsed.path == '/categories': body = categories_page(data)
+        elif parsed.path.startswith('/category/'):
+            requested_category = unquote(parsed.path.removeprefix('/category/')).replace('-', ' ').lower()
+            category = next((name for name in category_groups(data) if name.lower() == requested_category), requested_category.upper())
+            body = category_page(data, category, params.get('q', [''])[0])
+        elif parsed.path == '/about': body = info_page(data, 'OUR STORY', 'Beautiful things for everyday living.', data['shop'].get('description', ''), f'<p>{esc(data["shop"].get("tagline", "Thoughtful objects and considered rituals for living well."))}</p>')
+        elif parsed.path == '/contact': body = info_page(data, 'CONTACT', 'We are here to help.', 'Questions about an order, product or delivery? Our team would love to hear from you.', f'<div class="contact-list"><p><strong>Email</strong><br>{esc(data["shop"].get("email", ""))}</p><p><strong>Phone</strong><br>{esc(data["shop"].get("phone", ""))}</p><p><strong>WhatsApp</strong><br>{esc(data["shop"].get("whatsapp", ""))}</p><p><strong>Visit</strong><br>{esc(data["shop"].get("location", ""))}</p></div>')
+        elif parsed.path == '/faq': body = info_page(data, 'FAQ', 'A little clarity goes a long way.', 'Answers to the questions our clients ask most.', '<div class="faq-list"><details open><summary>How quickly do you deliver?</summary><p>{}</p></details><details><summary>Can I return an item?</summary><p>{}</p></details><details><summary>How can I contact the team?</summary><p>Reach us by phone, email or WhatsApp and we will be happy to help.</p></details></div>'.format(esc(data['shop'].get('delivery_information', 'We deliver as quickly as possible.')), esc(data['shop'].get('return_policy', 'Returns are accepted for eligible unused items.'))))
+        elif parsed.path == '/delivery': body = info_page(data, 'DELIVERY', 'The details, beautifully handled.', 'Everything you need to know about receiving your order.', f'<p>{esc(data["shop"].get("delivery_information", "Delivery information will be confirmed with your order."))}</p>')
+        elif parsed.path == '/returns': body = info_page(data, 'RETURNS & REFUNDS', 'A considered returns policy.', 'We want every purchase to feel right.', f'<p>{esc(data["shop"].get("return_policy", "Returns information will be confirmed with your order."))}</p>')
+        elif parsed.path == '/privacy': body = info_page(data, 'PRIVACY', 'Your trust matters.', 'How we use and protect your information.', f'<p>{esc(data["shop"].get("privacy_policy", "Your information is used only to process orders and provide support."))}</p>')
+        elif parsed.path == '/terms': body = info_page(data, 'TERMS', 'Clear terms for a better experience.', 'The simple principles behind every order.', f'<p>{esc(data["shop"].get("terms", "Orders are subject to availability and confirmation."))}</p>')
+        elif parsed.path in ('/', ''): body = home(data, params)
+        else: return self.send_error(404, 'That page does not exist.')
+        token = self.csrf_token(session)
+        body = body.replace('method="post"', f'method="post"><input type="hidden" name="csrf" value="{token}"') if 'method="post"' in body else body
+        secure = '; Secure' if self.secure_cookie() else ''
+        self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.send_header('Set-Cookie', f'luxe_session={self.session_token}; HttpOnly; SameSite=Lax; Max-Age={SESSION_MAX_SECONDS}; Path=/{secure}'); self.send_header('X-Content-Type-Options', 'nosniff'); self.send_header('X-Frame-Options', 'DENY'); self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin'); self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains' if os.environ.get('APP_ENV') == 'production' else 'max-age=0'); self.send_header('Content-Security-Policy', "default-src 'self' https://images.unsplash.com https://wa.me https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; form-action 'self' https://wa.me; frame-ancestors 'none'"); self.end_headers(); self.wfile.write(body.encode())
+    def do_POST(self):
+        if self.rate_limited(): return self.send_error(429, 'Please slow down and try again.')
+        length = int(self.headers.get('Content-Length', 0))
+        if length > MAX_REQUEST_BYTES: return self.send_error(413)
+        data = read_db(); session = self.session(); raw = self.rfile.read(length); form = parse_form(self.headers.get('Content-Type', ''), raw); action = form.get('action',[''])[0]; message = ''
+        if self.path == '/api/payments/mpesa/callback':
+            try:
+                callback_data = json.loads(raw.decode('utf-8'))
+                if apply_mpesa_callback(data, callback_data): write_db(data)
+            except (ValueError, UnicodeDecodeError, TypeError):
+                pass
+            self.send_response(204); self.end_headers(); return
+        if self.path == '/api/products' and self.headers.get('Content-Type', '').startswith('application/json'):
+            if not session.get('admin'): return send_json(self, {'error': 'Admin sign-in required'}, 403)
+            try: payload = json.loads(raw.decode('utf-8'))
+            except (ValueError, UnicodeDecodeError): return send_json(self, {'error': 'Invalid JSON'}, 400)
+            product_id = max([item.get('id', 0) for item in data.get('products', [])] or [0]) + 1; payload['id'] = product_id; payload.setdefault('stock', 0); payload.setdefault('price', 0); payload.setdefault('active', True); data.setdefault('products', []).append(payload); audit(data, session, 'product_create', f'{payload.get("name", "Product")} created via API'); write_db(data); return send_json(self, payload, 201)
+        csrf_valid = hmac.compare_digest(form.get('csrf', [''])[0], self.csrf_token(session))
+        if not csrf_valid and action not in ('login', 'register'):
+            return self.send_error(403, 'Your form session expired. Please refresh and try again.')
+        if action in ('settings', 'branding', 'stock', 'order_status', 'payment_status', 'delivery_status', 'coupon', 'coupon_toggle', 'coupon_delete', 'customer_toggle', 'staff_create', 'staff_toggle', 'review_moderate', 'product_create', 'product_update', 'product_delete', 'categories_save', 'feature', 'restore') and not session.get('admin'): return self.send_error(403, 'Admin sign-in required.')
+        if action == 'settings': data['shop']['name'] = form.get('shop_name',[data['shop']['name']])[0].strip() or data['shop']['name']; message = 'Shop information saved'
+        if action == 'branding':
+            for key in ('name','tagline','description','phone','whatsapp','email','location','business_hours','currency','country','delivery_fee','free_delivery_threshold','order_prefix','backup_schedule','backup_time','backup_day','backup_retention','logo','favicon','delivery_information','return_policy','privacy_policy','terms','story_heading','story_description','newsletter_heading','newsletter_description'):
+                if key in form: data['shop'][key] = form[key][0].strip()
+            for key in ('instagram', 'facebook', 'tiktok', 'x', 'youtube'):
+                form_key = f'social_{key}'
+                if form_key in form: data['shop'].setdefault('social', {})[key] = form[form_key][0].strip()
+            logo_files = [item.strip() for item in form.get('logo_file', []) if item.strip()]
+            if logo_files:
+                logo = logo_files[0]
+                if not logo.startswith(('/uploads/', 'https://', 'http://')):
+                    logo = '/uploads/' + Path(logo).name
+                data['shop']['logo'] = logo
+            integrations = data.setdefault('integrations', {})
+            for key in ('environment', 'shortcode', 'consumer_key', 'callback_url'):
+                form_key = f'mpesa_{key}'
+                if form_key in form: integrations[form_key] = form[form_key][0].strip()
+            for key in ('consumer_secret', 'passkey'):
+                form_key = f'mpesa_{key}'
+                if form.get(form_key, [''])[0].strip(): integrations[form_key] = form[form_key][0].strip()
+            for key in ('host', 'port', 'user', 'from'):
+                form_key = f'smtp_{key}'
+                if form_key in form: integrations[form_key] = form[form_key][0].strip()
+            if form.get('smtp_password', [''])[0].strip(): integrations['smtp_password'] = form['smtp_password'][0].strip()
+            if form.get('default_theme', ['system'])[0] in ('system', 'light', 'dark'):
+                data['shop']['default_theme'] = form['default_theme'][0]
+            if form.get('_upload_errors'):
+                message = form['_upload_errors'][0]
+            for key in ('heading', 'description', 'image', 'primary_label', 'primary_link', 'secondary_label', 'secondary_link'):
+                form_key = f'hero_{key}'
+                if form_key in form: data['shop'].setdefault('hero', {})[key] = form[form_key][0].strip()
+            if os.name == 'nt':
+                threading.Thread(target=update_windows_backup_schedule_background, args=(dict(data['shop']),), daemon=True).start()
+            message = 'Shop branding saved'; destination = '/admin/settings'
+        if action == 'categories_save':
+            updated_categories = {}
+            for index, category in enumerate(category_groups(data)):
+                subcategories = [line.strip() for line in form.get(f'category_{index}', [''])[0].splitlines() if line.strip()]
+                if subcategories: updated_categories[category] = subcategories
+            if len(updated_categories) != len(category_groups(data)):
+                message = 'Each category must contain at least one subcategory'; destination = '/admin/categories'
+            else:
+                data['category_hierarchy'] = updated_categories; message = 'Category hierarchy saved'; destination = '/admin/categories'
+        if action == 'restore':
+            try:
+                restored = json.loads(form.get('backup_file', [''])[0])
+                if not isinstance(restored, dict) or not isinstance(restored.get('products'), list) or not isinstance(restored.get('shop'), dict): raise ValueError
+                data = restored; audit(data, session, 'restore', 'Database backup restored'); message = 'Database restored'; destination = '/admin'
+            except (ValueError, TypeError, json.JSONDecodeError):
+                message = 'Invalid backup file'; destination = '/admin/restore'
+        if action == 'stock':
+            product = next((p for p in data['products'] if str(p['id']) == form.get('product_id',[''])[0]), None)
+            if product:
+                previous = product['stock']; product['stock'] = max(0, product['stock'] + int(form.get('amount',[0])[0])); data.setdefault('inventory_movements', []).append({'product_id': product['id'], 'quantity_change': product['stock'] - previous, 'previous_stock': previous, 'new_stock': product['stock'], 'reason': 'Admin adjustment', 'user': session.get('customer_id'), 'date': datetime.now().isoformat(timespec='seconds')}); message = f"{product['name']} inventory updated"
+        if action == 'feature':
+            product = next((p for p in data['products'] if str(p['id']) == form.get('product_id', [''])[0]), None)
+            section = form.get('section', [''])[0]
+            if product and section in HOMEPAGE_SECTIONS:
+                sections = product.setdefault('featured_sections', [])
+                if section in sections: sections.remove(section); message = f'{product["name"]} removed from {section}'
+                else: sections.append(section); message = f'{product["name"]} added to {section}'
+        if action == 'cart':
+            product = next((p for p in data['products'] if str(p['id']) == form.get('product_id',[''])[0]), None)
+            quantity = max(1, int(form.get('quantity', ['1'])[0]))
+            variant_id = form.get('variant_id', [''])[0]
+            variant = next((v for v in product.get('variants', []) if str(v.get('id')) == variant_id and v.get('active', True)), None) if product and variant_id else None
+            available_stock = variant.get('stock', 0) if variant else product.get('stock', 0) if product else 0
+            if not session.get('customer_id'):
+                if product and available_stock >= quantity:
+                    session['pending_cart'] = {'id': product['id'], 'variant_id': int(variant_id) if variant else None, 'quantity': quantity}
+                message = 'Please sign in or create an account before adding items to your bag'
+                destination = '/login'
+            elif product and available_stock >= quantity:
+                existing = next((item for item in session['cart'] if item['id'] == product['id'] and item.get('variant_id') == (int(variant_id) if variant else None)), None)
+                if existing: existing['quantity'] = min(available_stock, existing['quantity'] + quantity)
+                else: session['cart'].append({'id': product['id'], 'variant_id': int(variant_id) if variant else None, 'quantity': quantity})
+                message = 'Product added to bag'
+            else: message = 'Product is out of stock'
+        if action == 'cart_remove':
+            if not session.get('customer_id'):
+                message = 'Please sign in to manage your bag'; destination = '/login'
+            else:
+                product_id = int(form.get('product_id', [0])[0]); variant_id = form.get('variant_id', [''])[0]; session['cart'] = [item for item in session['cart'] if not (item['id'] == product_id and (not variant_id or str(item.get('variant_id', '')) == variant_id))]
+        if action == 'cart_update':
+            if not session.get('customer_id'):
+                message = 'Please sign in to manage your bag'; destination = '/login'
+            else:
+                product_id = int(form.get('product_id', [0])[0]); variant_id = form.get('variant_id', [''])[0]; change = int(form.get('change', [0])[0])
+                product = next((p for p in data['products'] if p['id'] == product_id), None)
+                variant = next((v for v in product.get('variants', []) if str(v.get('id')) == variant_id), None) if product and variant_id else None
+                item = next((item for item in session['cart'] if item['id'] == product_id and str(item.get('variant_id', '')) == variant_id), None)
+                available_stock = variant.get('stock', 0) if variant else product.get('stock', 0) if product else 0
+                if product and item: item['quantity'] = min(available_stock, max(0, item['quantity'] + change))
+                session['cart'] = [item for item in session['cart'] if item['quantity'] > 0]
+        if action == 'register':
+            email = form.get('email', [''])[0].strip().lower()
+            if any(c['email'] == email for c in data.get('customers', [])):
+                message = 'An account with that email already exists'; destination = '/register'
+            else:
+                customer = {'id': max([c['id'] for c in data.get('customers', [])] or [0]) + 1, 'name': form.get('name', [''])[0].strip(), 'email': email, 'phone': form.get('phone', [''])[0].strip(), 'password_hash': hash_password(form.get('password', [''])[0]), 'active': True, 'created_at': datetime.now().isoformat(timespec='seconds')}
+                data.setdefault('customers', []).append(customer); session['customer_id'] = customer['id']; session['customer_name'] = customer['name']; session['email'] = email; had_pending = bool(session.get('pending_cart')); add_pending_cart(data, session); message = 'Account created. Your item is in the bag.' if had_pending else 'Account created'; destination = '/cart' if had_pending else '/account'
+        if action == 'forgot_request':
+            email = form.get('email', [''])[0].strip().lower()
+            user = next((u for u in data.get('users', []) + data.get('customers', []) if u.get('email', '').lower() == email and u.get('active', True)), None)
+            if user:
+                code = f'{secrets.randbelow(1000000):06d}'
+                try:
+                    send_password_otp(data, email, code)
+                    data.setdefault('password_reset_otps', {})[email] = {'hash': hashlib.sha256(code.encode()).hexdigest(), 'expires_at': time.time() + 600, 'attempts': 0}
+                except (OSError, RuntimeError, smtplib.SMTPException):
+                    pass
+            destination = '/forgot-password?message=' + urlencode({'message': 'If that email is registered, an OTP has been sent.'}).split('=', 1)[-1]
+            if user and email in data.get('password_reset_otps', {}):
+                destination = '/reset-password?email=' + urlencode({'email': email}).split('=', 1)[-1]
+        if action == 'forgot_reset':
+            email = form.get('email', [''])[0].strip().lower()
+            otp = form.get('otp', [''])[0].strip()
+            reset = data.get('password_reset_otps', {}).get(email)
+            if not reset or reset.get('expires_at', 0) < time.time() or reset.get('attempts', 0) >= 5:
+                message = 'This OTP is invalid or expired'; destination = '/forgot-password'
+            else:
+                reset['attempts'] = reset.get('attempts', 0) + 1
+                if not hmac.compare_digest(reset.get('hash', ''), hashlib.sha256(otp.encode()).hexdigest()):
+                    message = 'This OTP is invalid or expired'; destination = '/reset-password?email=' + urlencode({'email': email}).split('=', 1)[-1]
+                else:
+                    user = next((u for u in data.get('users', []) + data.get('customers', []) if u.get('email', '').lower() == email and u.get('active', True)), None)
+                    if not user or len(form.get('password', [''])[0]) < 8:
+                        message = 'Enter a valid new password'; destination = '/reset-password?email=' + urlencode({'email': email}).split('=', 1)[-1]
+                    else:
+                        user['password_hash'] = hash_password(form['password'][0]); data['password_reset_otps'].pop(email, None); message = 'Password reset successfully'; destination = '/login'
+        if action == 'login':
+            email = form.get('email', [''])[0].strip().lower()
+            user = next((u for u in data.get('users', []) + data.get('customers', []) if u.get('email') == email and u.get('active', True)), None)
+            if user and check_password(form.get('password', [''])[0], user.get('password_hash', '')):
+                session.pop('admin', None); session.pop('role', None); session.pop('email', None)
+                session['customer_id'] = user['id']; session['customer_name'] = user.get('name', 'Customer'); session['email'] = user.get('email', email); session['role'] = user.get('role', 'CUSTOMER'); session['admin'] = is_admin_role(session['role']); had_pending = bool(session.get('pending_cart')); add_pending_cart(data, session); destination = '/admin' if session['admin'] else '/cart' if had_pending else '/account'
+            else: message = 'Invalid email or password'; destination = '/login'
+        if action == 'account_update' and session.get('customer_id'):
+            account = current_account(data, session)
+            if account:
+                account['name'] = form.get('name', [account.get('name', '')])[0].strip() or account.get('name', 'Customer')
+                account['phone'] = form.get('phone', [account.get('phone', '')])[0].strip()
+                session['customer_name'] = account['name']
+                message = 'Your details were saved'
+            else:
+                message = 'Account not found'
+            destination = '/account'
+        if action == 'account_password' and session.get('customer_id'):
+            account = current_account(data, session)
+            current_password = form.get('current_password', [''])[0]
+            new_password = form.get('new_password', [''])[0]
+            confirm_password = form.get('confirm_password', [''])[0]
+            if not account or not check_password(current_password, account.get('password_hash', '')):
+                message = 'Current password is incorrect'
+            elif len(new_password) < 8:
+                message = 'New password must be at least 8 characters'
+            elif new_password != confirm_password:
+                message = 'New passwords do not match'
+            else:
+                account['password_hash'] = hash_password(new_password)
+                message = 'Your password was changed'
+            destination = '/account'
+        if action == 'wishlist':
+            if not session.get('customer_id'):
+                message = 'Please sign in to manage your wishlist'; destination = '/login'
+            else:
+                product_id = int(form.get('product_id', [0])[0]); key = str(session['customer_id'])
+                saved = data.setdefault('wishlists', {}).setdefault(key, [])
+                if product_id in saved: saved.remove(product_id); message = 'Removed from wishlist'
+                else: saved.append(product_id); message = 'Added to wishlist'
+                destination = '/wishlist'
+        if action == 'newsletter':
+            email = form.get('email', [''])[0].strip().lower()
+            if '@' not in email or '.' not in email.rsplit('@', 1)[-1]:
+                message = 'Please enter a valid email address'
+            elif email in data.setdefault('newsletter_subscribers', []):
+                message = 'You are already on the list'
+            else:
+                data['newsletter_subscribers'].append(email); message = 'You are now on the Luxe list'
+            destination = '/'
+        if action == 'review' and session.get('customer_id'):
+            product_id = int(form.get('product_id', [0])[0])
+            purchased = any(order.get('customer_id') == session['customer_id'] and any(item.get('product_id') == product_id for item in order.get('items', [])) for order in data.get('orders', []))
+            if not purchased:
+                message = 'Reviews are available after purchase'; destination = '/product?id=' + str(product_id)
+            else:
+                already_reviewed = any(r.get('product_id') == product_id and r.get('customer_id') == session['customer_id'] for r in data.get('reviews', []))
+                if not already_reviewed:
+                    customer = next((c for c in data.get('customers', []) if c['id'] == session['customer_id']), {})
+                    data.setdefault('reviews', []).append({'id': len(data.get('reviews', [])) + 1, 'product_id': product_id, 'customer_id': session['customer_id'], 'customer_name': customer.get('name', 'Customer'), 'rating': max(1, min(5, int(form.get('rating', ['5'])[0]))), 'text': form.get('text', [''])[0].strip(), 'approved': False, 'created_at': datetime.now().isoformat(timespec='seconds')})
+                    message = 'Review submitted for admin approval'; destination = '/product?id=' + str(product_id)
+        if action == 'review' and not session.get('customer_id'):
+            message = 'Sign in before reviewing a product'; destination = '/login'
+        if action == 'order_status' and session.get('admin'):
+            order = next((o for o in data.get('orders', []) if o.get('order_number') == form.get('order_number', [''])[0]), None)
+            if order:
+                old_status = order.get('status', 'Pending'); order['status'] = form.get('status', ['Pending'])[0]; data.setdefault('audit_logs', []).append({'user': session.get('customer_name', 'Admin'), 'action': 'order_status', 'description': f'{order["order_number"]}: {old_status} to {order["status"]}', 'ip_address': self.client_address[0], 'date': datetime.now().isoformat(timespec='seconds')}); message = 'Order status updated'; destination = '/admin/orders'
+        if action in ('payment_status', 'delivery_status') and session.get('admin'):
+            order = next((o for o in data.get('orders', []) if o.get('order_number') == form.get('order_number', [''])[0]), None)
+            if order:
+                key = 'payment_status' if action == 'payment_status' else 'delivery_status'
+                previous_status = order.get(key, 'Pending')
+                order[key] = form.get(key, ['Pending'])[0]
+                if action == 'delivery_status' and order[key] == 'Delivered':
+                    order['status'] = 'Delivered'
+                    if previous_status != 'Delivered':
+                        order['delivered_at'] = datetime.now().isoformat(timespec='seconds')
+                        threading.Thread(target=notify_order_delivered, args=(data, dict(order)), daemon=True).start()
+                audit(data, session, action, f'{order["order_number"]}: {order[key]}')
+                message = 'Payment updated' if action == 'payment_status' else 'Delivery updated'
+                destination = '/admin/payments' if action == 'payment_status' else '/admin/deliveries'
+        if action == 'coupon' and session.get('admin'):
+            code = form.get('code', [''])[0].strip().upper()
+            if not any(c.get('code') == code for c in data.get('coupons', [])):
+                data.setdefault('coupons', []).append({'code': code, 'type': 'percentage', 'value': int(form.get('value', ['0'])[0]), 'minimum_order': 0, 'usage_limit': int(form.get('usage_limit', ['100'])[0]), 'used': 0, 'active': True})
+                message = 'Coupon created'; destination = '/admin/promotions'
+        if action in ('coupon_toggle', 'coupon_delete') and session.get('admin'):
+            code = form.get('code', [''])[0].strip().upper()
+            coupon = next((item for item in data.get('coupons', []) if item.get('code') == code), None)
+            if coupon and action == 'coupon_toggle':
+                coupon['active'] = not coupon.get('active', True); message = 'Coupon status updated'
+            elif coupon:
+                data['coupons'].remove(coupon); message = 'Coupon deleted'
+            destination = '/admin/promotions'
+        if action == 'customer_toggle' and session.get('admin'):
+            customer = next((c for c in data.get('customers', []) if c['id'] == int(form.get('customer_id', [0])[0])), None)
+            if customer: customer['active'] = not customer.get('active', True); message = 'Customer status updated'; destination = '/admin/customers'
+        if action == 'staff_create' and session.get('admin'):
+            email = form.get('staff_email', [''])[0].strip().lower()
+            if any(user.get('email') == email for user in data.get('users', [])):
+                message = 'A staff account with that email already exists'
+            else:
+                staff_id = max([user.get('id', 0) for user in data.get('users', [])] or [0]) + 1
+                data.setdefault('users', []).append({'id': staff_id, 'name': form.get('staff_name', [''])[0].strip(), 'email': email, 'password_hash': hash_password(form.get('staff_password', [''])[0]), 'role': form.get('staff_role', ['STAFF'])[0], 'active': True}); audit(data, session, 'staff_create', f'{email} staff account created'); message = 'Staff account created'
+            destination = '/admin/staff'
+        if action == 'staff_toggle' and session.get('admin'):
+            staff_id = int(form.get('staff_id', [0])[0])
+            user = next((item for item in data.get('users', []) if item.get('id') == staff_id), None)
+            if user and user.get('id') != session.get('customer_id'):
+                user['active'] = not user.get('active', True); audit(data, session, 'staff_toggle', f'{user.get("email", "Staff")} status updated'); message = 'Staff status updated'
+            destination = '/admin/staff'
+        if action == 'review_moderate' and session.get('admin'):
+            review = next((r for r in data.get('reviews', []) if r['id'] == int(form.get('review_id', [0])[0])), None); decision = form.get('decision', ['hide'])[0]
+            if review and decision == 'delete': data['reviews'].remove(review)
+            elif review: review['approved'] = decision == 'approve'; review['hidden'] = decision == 'hide'
+            message = 'Review moderation saved'; destination = '/admin/reviews'
+        if action == 'product_create' and session.get('admin'):
+            product_id = max([p['id'] for p in data['products']] or [0]) + 1; image_files = [image.strip() for image in form.get('image_file', []) if image.strip()]; image = image_files[0] if image_files else ''
+            variants = []
+            for index, line in enumerate(form.get('variants', [''])[0].splitlines(), 1):
+                parts = [part.strip() for part in line.split('|')]
+                if len(parts) == 3 and parts[0]: variants.append({'id': index, 'name': parts[0], 'price': float(parts[1]), 'stock': max(0, int(float(parts[2]))), 'active': True})
+            data['products'].append({'id': product_id, 'name': form.get('name', [''])[0].strip(), 'sku': form.get('sku', [''])[0].strip(), 'brand': form.get('brand', [''])[0].strip(), 'category': form.get('category', [''])[0].strip(), 'subcategory': form.get('subcategory', [''])[0].strip(), 'price': float(form.get('price', ['0'])[0]), 'old_price': float(form.get('discount_price', ['0'])[0]) or None, 'stock': int(float(form.get('stock', ['0'])[0])), 'minimum_stock': int(float(form.get('minimum_stock', ['5'])[0])), 'rating': 0, 'tag': 'New', 'image': image, 'images': image_files, 'variants': variants, 'description': form.get('description', [''])[0].strip(), 'tags': [tag.strip() for tag in form.get('tags', [''])[0].split(',') if tag.strip()], 'created_at': datetime.now().isoformat(timespec='seconds')})
+            message = 'Product created'; destination = '/admin/products'
+        if action == 'product_update' and session.get('admin'):
+            product = next((p for p in data['products'] if str(p['id']) == form.get('product_id', [''])[0]), None)
+            if product:
+                for key in ('name', 'sku', 'brand', 'category', 'subcategory', 'description'):
+                    product[key] = form.get(key, [product.get(key, '')])[0].strip()
+                product['price'] = float(form.get('price', [product['price']])[0]); product['old_price'] = float(form.get('discount_price', [product.get('old_price') or 0])[0]) or None; product['stock'] = max(0, int(float(form.get('stock', [product['stock']])[0]))); product['minimum_stock'] = max(0, int(float(form.get('minimum_stock', [product.get('minimum_stock', 5)])[0]))); product['tags'] = [tag.strip() for tag in form.get('tags', [', '.join(product.get('tags', []))])[0].split(',') if tag.strip()]
+                image_files = [image.strip() for image in form.get('image_file', []) if image.strip()]
+                if image_files: product['image'] = image_files[0]; product['images'] = image_files
+                variants = []
+                for index, line in enumerate(form.get('variants', [''])[0].splitlines(), 1):
+                    parts = [part.strip() for part in line.split('|')]
+                    if len(parts) == 3 and parts[0]: variants.append({'id': index, 'name': parts[0], 'price': float(parts[1]), 'stock': max(0, int(float(parts[2]))), 'active': True})
+                if 'variants' in form: product['variants'] = variants
+                message = 'Product updated'; destination = '/admin'
+        if action == 'product_delete' and session.get('admin'):
+            product = next((p for p in data['products'] if str(p['id']) == form.get('product_id', [''])[0]), None)
+            if product:
+                data['products'].remove(product); audit(data, session, 'product_delete', f'{product["name"]} deleted'); message = 'Product deleted'; destination = '/admin'
+        checkout_discount = 0
+        checkout_coupon = None
+        checkout_completed = False
+        whatsapp_order_url = ''
+        payment_error = False
+        mpesa_phone = form.get('mpesa_phone', [''])[0].strip() or form.get('phone', [''])[0].strip()
+        mpesa_missing = action == 'checkout' and session.get('customer_id') and session.get('cart') and form.get('payment_method', ['Cash on Delivery'])[0] == 'M-Pesa' and not mpesa_phone
+        if action == 'checkout' and (not session.get('customer_id') or not session.get('cart')):
+            message = 'Please sign in and add at least one item before checking out'; destination = '/login' if not session.get('customer_id') else '/cart'
+        if mpesa_missing:
+            message = 'Enter the M-Pesa phone number to continue'; destination = '/checkout'
+        if action == 'checkout' and session.get('customer_id') and session.get('cart') and not mpesa_missing:
+            checkout_coupon = next((coupon for coupon in data.get('coupons', []) if coupon.get('code') == form.get('coupon_code', [''])[0].strip().upper() and coupon.get('active', True)), None)
+            if checkout_coupon:
+                subtotal_for_coupon = sum(cart_item_price(data, item) * item['quantity'] for item in session['cart'])
+                checkout_discount = subtotal_for_coupon * checkout_coupon.get('value', 0) / 100 if checkout_coupon.get('type') == 'percentage' else checkout_coupon.get('value', 0)
+            order_prefix = str(data.get('shop', {}).get('order_prefix', 'ORD')).strip().upper() or 'ORD'
+            order_number = order_prefix + '-' + datetime.now().strftime('%Y%m%d') + '-' + secrets.token_hex(2).upper()
+            subtotal = sum(cart_item_price(data, item) * item['quantity'] for item in session['cart'])
+            free_delivery_threshold = shop_number(data, 'free_delivery_threshold', 10000)
+            configured_delivery_fee = shop_number(data, 'delivery_fee', 350)
+            delivery_fee = 0 if subtotal >= free_delivery_threshold else configured_delivery_fee
+            order_payment_method = form.get('payment_method', ['M-Pesa'])[0]
+            order = {'order_number': order_number, 'customer_id': session.get('customer_id'), 'status': 'Pending', 'payment_method': order_payment_method, 'payment_status': 'Pending', 'mpesa_phone': mpesa_phone if order_payment_method == 'M-Pesa' else '', 'subtotal': subtotal, 'discount': 0, 'delivery_fee': delivery_fee, 'total': subtotal + delivery_fee, 'customer_name': form.get('full_name', [''])[0], 'phone': form.get('phone', [''])[0], 'email': form.get('email', [''])[0], 'address': form.get('address', [''])[0], 'location': form.get('location', [''])[0], 'created_at': datetime.now().isoformat(timespec='seconds'), 'items': [{'product_id': item['id'], 'variant_id': item.get('variant_id'), 'quantity': item['quantity'], 'unit_price': cart_item_price(data, item)} for item in session['cart']]}
+            data.setdefault('orders', []).append(order)
+            if order_payment_method == 'M-Pesa':
+                try:
+                    stk_response = initiate_mpesa(data, mpesa_phone, order['total'], order_number)
+                    order['mpesa_checkout_request_id'] = stk_response['CheckoutRequestID']
+                    order['mpesa_customer_message'] = stk_response.get('CustomerMessage', 'Check your phone to complete payment')
+                except Exception as error:
+                    order['payment_status'] = 'Failed'
+                    order['mpesa_result_description'] = str(error)
+                    payment_error = True
+                    message = f'M-Pesa payment request failed: {error}'
+                    destination = '/checkout'
+            if order_payment_method == 'Order on WhatsApp':
+                item_details = []
+                for item in session['cart']:
+                    product = next((product for product in data['products'] if product.get('id') == item['id']), {})
+                    variant = cart_item_variant(data, item)
+                    option = f'Option: {variant.get("name", "")} | ' if variant else ''
+                    item_details.append(f'{product.get("name", "Product")} | Brand: {product.get("brand", "")} | SKU: {product.get("sku", "")} | {option}Qty: {item["quantity"]} | Unit price: {money(cart_item_price(data, item))}')
+                item_summary = '; '.join(item_details)
+                whatsapp_text = f'New order {order_number}. Customer name: {form.get("full_name", [""])[0]}. Customer phone: {form.get("phone", [""])[0]}. Email: {form.get("email", [""])[0]}. Delivery address: {form.get("address", [""])[0]}. County/Town: {form.get("location", [""])[0]}. Payment method: {order_payment_method}. Items: {item_summary}. Subtotal: {money(subtotal)}. Delivery fee: {money(order["delivery_fee"])}. Total: {money(order["total"])}.'
+                whatsapp_order_url = whatsapp_url(data['shop'].get('whatsapp', ''), whatsapp_text)
+            for item in session['cart'] if not payment_error else []:
+                product = next((p for p in data['products'] if p['id'] == item['id']), None)
+                variant = cart_item_variant(data, item)
+                if variant: variant['stock'] = max(0, variant.get('stock', 0) - item['quantity'])
+                elif product: product['stock'] = max(0, product['stock'] - item['quantity'])
+            if not payment_error:
+                session['cart'] = []; message = f'Order {order_number} confirmed'
+                checkout_completed = True
+            if checkout_coupon and data.get('orders'):
+                order = data['orders'][-1]; order['discount'] = min(checkout_discount, order['subtotal']); order['total'] = order['subtotal'] - order['discount'] + order['delivery_fee']; checkout_coupon['used'] = checkout_coupon.get('used', 0) + 1
+        write_db(data)
+        if 'destination' not in locals():
+            destination = '/cart' if action in ('cart', 'cart_remove', 'cart_update') else '/admin'
+        if action == 'cart' and not session.get('customer_id'):
+            destination = '/login'
+        if action == 'cart' and 'buy_now' in form and session.get('customer_id'):
+            destination = '/checkout'
+        if action == 'checkout' and checkout_completed:
+            if whatsapp_order_url:
+                session['whatsapp_order_url'] = whatsapp_order_url
+            destination = '/order-confirmation?order=' + urlencode({'order': order_number}).split('=', 1)[-1]
+            threading.Thread(target=notify_order_by_email, args=(data, dict(order)), daemon=True).start()
+        if message and not whatsapp_order_url: destination += '?' + urlencode({'message': message})
+        secure = '; Secure' if self.secure_cookie() else ''
+        self.send_response(303); self.send_header('Location', destination); self.send_header('Set-Cookie', f'luxe_session={self.session_token}; HttpOnly; SameSite=Lax; Max-Age={SESSION_MAX_SECONDS}; Path=/{secure}'); self.send_header('Cache-Control', 'no-store'); self.end_headers()
+
+if __name__ == '__main__':
+    if '--backup-once' in sys.argv:
+        run_backup_once()
+        raise SystemExit(0)
+    (ROOT / 'uploads').mkdir(exist_ok=True)
+    host = os.environ.get('HOST', '0.0.0.0')
+    port = int(os.environ.get('PORT', '8000'))
+    if os.name == 'nt':
+        try:
+            data = read_db(); apply_windows_backup_schedule(data.get('shop', {}))
+        except Exception:
+            pass
+    print(f'Luxe Beauty Hub: http://{host}:{port}')
+    threading.Thread(target=scheduled_backup_loop, daemon=True, name='scheduled-backups').start()
+    BoundedThreadingHTTPServer((host, port), Store).serve_forever()

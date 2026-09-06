@@ -1,0 +1,42 @@
+<main class="checkout checkout-page">
+  <section>
+    <p class="eyebrow">SECURE CHECKOUT</p>
+    <h1>Complete your <em>order.</em></h1>
+    {{message}}
+    <form method="post" class="checkout-form">
+      <input type="hidden" name="action" value="checkout">
+      <div class="checkout-field"><label for="checkout-name">Full name</label><input id="checkout-name" name="full_name" required></div>
+      <div class="checkout-field"><label for="checkout-email">Email address</label><input id="checkout-email" name="email" type="email" required></div>
+      <div class="checkout-field"><label for="checkout-phone">Phone number</label><input id="checkout-phone" name="phone" required></div>
+      <div class="checkout-field"><label for="checkout-address">Delivery address</label><textarea id="checkout-address" name="address" required></textarea></div>
+      <div class="checkout-field"><label for="checkout-location">County / Town</label><input id="checkout-location" name="location" required></div>
+      <div class="checkout-field"><label for="checkout-coupon">Coupon code</label><input id="checkout-coupon" name="coupon_code" placeholder="Optional"></div>
+      <div class="checkout-field"><label for="checkout-payment">How would you like to order?</label><select id="checkout-payment" name="payment_method"><option {{payment_method_m_pesa}}>M-Pesa</option><option {{payment_method_whatsapp}}>Order on WhatsApp</option></select></div>
+      <div class="checkout-field" id="mpesa-phone-field" hidden><label for="mpesa-phone">M-Pesa phone number</label><input id="mpesa-phone" name="mpesa_phone" type="tel" inputmode="tel" placeholder="+254 700 000 000" autocomplete="tel"><small class="note">We will use your checkout phone number unless you enter a different M-Pesa number.</small></div>
+      <button class="primary">Place order securely ↗</button>
+    </form>
+  </section>
+   <script>
+     const paymentSelect = document.getElementById('checkout-payment');
+     const mpesaPhoneField = document.getElementById('mpesa-phone-field');
+     const mpesaPhone = document.getElementById('mpesa-phone');
+     const checkoutPhone = document.getElementById('checkout-phone');
+     const updateMpesaField = () => {
+       const isMpesa = paymentSelect.value === 'M-Pesa';
+       mpesaPhoneField.hidden = !isMpesa;
+       mpesaPhone.required = isMpesa;
+       if (isMpesa && !mpesaPhone.value) mpesaPhone.value = checkoutPhone.value;
+     };
+     paymentSelect.addEventListener('change', updateMpesaField);
+     checkoutPhone.addEventListener('input', () => {
+       if (paymentSelect.value === 'M-Pesa' && !mpesaPhone.value) mpesaPhone.value = checkoutPhone.value;
+     });
+     updateMpesaField();
+   </script>
+  <aside class="summary">
+    <p class="eyebrow">ORDER SUMMARY</p>
+    <h2>Delivery details</h2>
+    <div class="checkout-items">{{items}}</div>
+    <p class="hero-text">Your order will be confirmed immediately and stock will be reserved for delivery.</p>
+  </aside>
+</main>

@@ -1,0 +1,17 @@
+<main class="checkout cart-page">
+  <section>
+    <p class="eyebrow">YOUR SELECTION</p>
+    <h1>Shopping <em>bag.</em></h1>
+    {{rows}}
+    <a class="under" href="/">Continue shopping ↗</a>
+  </section>
+  <aside class="summary">
+    <p class="eyebrow">ORDER SUMMARY</p>
+    <h2>Ready when you are</h2>
+    <div class="checkout-row"><span>Subtotal</span><b>{{subtotal}}</b></div>
+    <div class="checkout-row"><span>Discounts</span><b>- {{discount}}</b></div>
+    <div class="checkout-row"><span>Delivery</span><b>{{delivery}}</b></div>
+    <div class="checkout-row total"><span>Total</span><b>{{total}}</b></div>
+    {{actions}}
+  </aside>
+</main>

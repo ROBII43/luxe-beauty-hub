@@ -1,0 +1,448 @@
+{
+  "shop": {
+    "name": "LUXE BEAUTY HUB",
+    "tagline": "Small luxuries for a life well lived.",
+    "description": "Perfumes, beauty, lifestyle and home essentials all in one place.",
+    "logo": "",
+    "favicon": "",
+    "phone": "+254 700 000 000",
+    "currency": "KSh",
+    "country": "Kenya",
+    "location": "Nairobi, Kenya",
+    "business_hours": "Mon - Sat, 9:00 AM - 6:00 PM",
+    "email": "hello@luxe-beauty-hub.example",
+    "whatsapp": "+254 700 000 000",
+    "delivery_information": "Complimentary delivery on orders over KSh 10,000.",
+    "return_policy": "Returns accepted within 14 days for unused products.",
+    "privacy_policy": "Customer information is used only to process orders and provide support.",
+    "terms": "Orders are subject to product availability and confirmation.",
+    "social": {
+      "instagram": "",
+      "facebook": "",
+      "tiktok": "",
+      "x": "",
+      "youtube": ""
+    },
+    "hero": {
+      "heading": "Naturally luxurious beauty.",
+      "description": "Exceptional natural beauty, skin, hair and lifestyle essentials chosen with purity, honesty and intention.",
+      "image": "https://images.unsplash.com/photo-1556229010-6c3f2c9ca5f8?auto=format&fit=crop&w=1300&q=90",
+      "primary_label": "Shop the edit",
+      "primary_link": "/#catalog",
+      "secondary_label": "Explore fragrance",
+      "secondary_link": "/?category=Perfume"
+    }
+  },
+  "categories": [
+    {
+      "name": "Perfume",
+      "label": "PERFUMES",
+      "description": "Scent stories for every mood",
+      "image": "https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=700&q=80"
+    },
+    {
+      "name": "Skincare",
+      "label": "SELF CARE",
+      "description": "Small rituals, big feelings",
+      "image": "https://images.unsplash.com/photo-1570172619644-dfd03ed5d881?auto=format&fit=crop&w=700&q=80"
+    },
+    {
+      "name": "Home & Kitchen",
+      "label": "HOME EDIT",
+      "description": "Objects with a point of view",
+      "image": "https://images.unsplash.com/photo-1556912167-f556f1f39fdf?auto=format&fit=crop&w=700&q=80"
+    }
+  ],
+  "users": [
+    {
+      "id": 1,
+      "name": "Store Administrator",
+      "email": "admin@luxe.local",
+      "phone": "+254 700 000 000",
+      "password_hash": "scrypt$8887c67399c64fcd2d11e584b6c3405b$a3c9ebc5404b774a44cf655d2033dd211fc3fe0319030e97be18abb7aa20e6304a24e920f048d851c1a34d610d2beb65fd69f8233747894e4b8a6db6210703ef",
+      "role": "SUPER_ADMIN",
+      "active": true
+    }
+  ],
+  "customers": [
+    {
+      "id": 1,
+      "name": "ROBINSON KIPKORIR",
+      "email": "kipkoriruto1@gmail.com",
+      "phone": "0743535400",
+      "password_hash": "scrypt$08d4118cc26a9737e808798deffaa274$5bcf14f9462da9888e4d14c3f70fc78137901a3d9f6302e3afa6c4698a3a46d5d1d7fec6be4e80bab0d4bff03346557a94fc5be9e329f2ed3a97e442a159f2d0",
+      "active": true,
+      "created_at": "2026-09-04T10:30:26"
+    }
+  ],
+  "orders": [],
+  "wishlists": {},
+  "reviews": [],
+  "coupons": [
+    {
+      "code": "SAVE20",
+      "type": "percentage",
+      "value": 20,
+      "minimum_order": 0,
+      "usage_limit": 100,
+      "used": 0,
+      "active": true
+    }
+  ],
+  "products": [
+    {
+      "id": 1,
+      "name": "Santal 33 Eau de Parfum",
+      "brand": "Le Labo",
+      "sku": "LUX-PER-001",
+      "subcategory": "Unisex Perfumes",
+      "description": "A woody, aromatic fragrance with a warm signature.",
+      "specifications": {
+        "size": "50ml",
+        "finish": "Eau de parfum"
+      },
+      "tags": [
+        "unisex",
+        "woody",
+        "bestseller"
+      ],
+      "images": [
+        "https://images.unsplash.com/photo-1547887538-e3a2f32cb1cc?auto=format&fit=crop&w=900&q=85",
+        "https://images.unsplash.com/photo-1592945403244-b3fbafd7f539?auto=format&fit=crop&w=900&q=85"
+      ],
+      "category": "Perfume",
+      "price": 12400,
+      "old_price": 14800,
+      "stock": 12,
+      "rating": 4.9,
+      "tag": "Bestseller",
+      "image": "https://images.unsplash.com/photo-1547887538-e3a2f32cb1cc?auto=format&fit=crop&w=900&q=85"
+    },
+    {
+      "id": 2,
+      "name": "Nourishing Glow Serum",
+      "brand": "Aesop",
+      "sku": "LUX-SKI-002",
+      "subcategory": "Serums",
+      "description": "A nourishing daily serum for a soft, healthy glow.",
+      "specifications": {
+        "size": "30ml",
+        "skin_type": "All skin types"
+      },
+      "tags": [
+        "glow",
+        "serum"
+      ],
+      "images": [
+        "https://images.unsplash.com/photo-1620916566398-39f1143ab7be?auto=format&fit=crop&w=900&q=85"
+      ],
+      "category": "Skincare",
+      "price": 6800,
+      "stock": 4,
+      "rating": 4.8,
+      "tag": "New",
+      "image": "https://images.unsplash.com/photo-1620916566398-39f1143ab7be?auto=format&fit=crop&w=900&q=85"
+    },
+    {
+      "id": 3,
+      "name": "The Daily Ritual Mug",
+      "brand": "Luxe Home",
+      "sku": "LUX-HOM-003",
+      "subcategory": "Ceramic Mugs",
+      "description": "A considered ceramic mug for slow mornings.",
+      "specifications": {
+        "material": "Ceramic",
+        "capacity": "350ml"
+      },
+      "tags": [
+        "mug",
+        "gift"
+      ],
+      "images": [
+        "https://images.unsplash.com/photo-1514228742587-6b1558fcca3d?auto=format&fit=crop&w=900&q=85"
+      ],
+      "category": "Home & Kitchen",
+      "price": 2200,
+      "stock": 24,
+      "rating": 4.7,
+      "tag": "Editor pick",
+      "image": "https://images.unsplash.com/photo-1514228742587-6b1558fcca3d?auto=format&fit=crop&w=900&q=85"
+    },
+    {
+      "id": 4,
+      "name": "Silk Scrunchie Set",
+      "brand": "Slip",
+      "sku": "LUX-LIF-004",
+      "subcategory": "Hair Accessories",
+      "description": "A set of smooth silk scrunchies that protect your hair.",
+      "specifications": {
+        "material": "Silk",
+        "quantity": "3 piece set"
+      },
+      "tags": [
+        "silk",
+        "accessory"
+      ],
+      "images": [
+        "https://images.unsplash.com/photo-1596462502278-27bfdc403348?auto=format&fit=crop&w=900&q=85"
+      ],
+      "category": "Lifestyle",
+      "price": 1800,
+      "stock": 18,
+      "rating": 4.6,
+      "tag": "Giftable",
+      "image": "https://images.unsplash.com/photo-1596462502278-27bfdc403348?auto=format&fit=crop&w=900&q=85"
+    },
+    {
+      "id": 5,
+      "name": "Mini Travel Fragrance Set",
+      "brand": "Byredo",
+      "sku": "LUX-PER-005",
+      "subcategory": "Mini/Travel Perfumes",
+      "description": "A portable selection of signature scents.",
+      "specifications": {
+        "size": "3 x 12ml",
+        "finish": "Eau de parfum"
+      },
+      "tags": [
+        "travel",
+        "gift"
+      ],
+      "images": [
+        "https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=900&q=85"
+      ],
+      "category": "Perfume",
+      "price": 9100,
+      "old_price": 10200,
+      "stock": 8,
+      "rating": 4.9,
+      "tag": "Limited",
+      "image": "https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=900&q=85"
+    },
+    {
+      "id": 6,
+      "name": "Cloud Whip Body Cream",
+      "brand": "Nécessaire",
+      "sku": "LUX-SKI-006",
+      "subcategory": "Body Lotions",
+      "description": "A rich body cream for everyday care.",
+      "specifications": {
+        "size": "200ml",
+        "skin_type": "Dry skin"
+      },
+      "tags": [
+        "body care"
+      ],
+      "images": [
+        "https://images.unsplash.com/photo-1556228578-8c89e6adf883?auto=format&fit=crop&w=900&q=85"
+      ],
+      "category": "Skincare",
+      "price": 4200,
+      "stock": 0,
+      "rating": 4.5,
+      "tag": "Sold out",
+      "image": "https://images.unsplash.com/photo-1556228578-8c89e6adf883?auto=format&fit=crop&w=900&q=85"
+    }
+  ],
+  "category_hierarchy": {
+    "PERFUMES & FRAGRANCES": [
+      "Women's Perfumes",
+      "Men's Perfumes",
+      "Unisex Perfumes",
+      "Body Mists",
+      "Body Sprays",
+      "Perfume Oils",
+      "Roll-on Perfumes",
+      "Perfume Gift Sets",
+      "Mini/Travel Perfumes",
+      "Fragrance Lotions",
+      "Perfume & Body Mist Sets",
+      "Fragrance Accessories"
+    ],
+    "HAIRCARE": [
+      "Shampoos",
+      "Conditioners",
+      "Hair Treatments",
+      "Hair Masks",
+      "Hair Oils",
+      "Hair Serums",
+      "Leave-in Conditioners",
+      "Hair Creams",
+      "Edge Control",
+      "Hair Gels",
+      "Hair Sprays",
+      "Scalp Care",
+      "Hair Growth Products",
+      "Heat Protectants",
+      "Hair Accessories"
+    ],
+    "SKINCARE": [
+      "Facial Cleansers",
+      "Toners",
+      "Moisturizers",
+      "Serums",
+      "Face Masks",
+      "Sunscreens",
+      "Body Lotions",
+      "Body Oils",
+      "Body Scrubs",
+      "Shower Gels",
+      "Body Wash",
+      "Hand & Foot Care",
+      "Lip Care",
+      "Acne/Spot Care",
+      "Skincare Gift Sets"
+    ],
+    "MAKEUP & COSMETICS": [
+      "Foundation",
+      "Concealer",
+      "Powder",
+      "Blush",
+      "Bronzer",
+      "Highlighter",
+      "Eyeshadow",
+      "Eyeliner",
+      "Mascara",
+      "Eyebrow Products",
+      "Lipsticks",
+      "Lip Gloss",
+      "Lip Liners",
+      "Setting Spray",
+      "Makeup Brushes",
+      "Makeup Sponges",
+      "Makeup Bags",
+      "Makeup Gift Sets"
+    ],
+    "JEWELLERY": [
+      "Necklaces",
+      "Earrings",
+      "Bracelets",
+      "Rings",
+      "Anklets",
+      "Jewellery Sets",
+      "Watches & Jewellery Sets",
+      "Stainless Steel Jewellery",
+      "Fashion Jewellery",
+      "Jewellery Boxes",
+      "Jewellery Organizers"
+    ],
+    "GIFT & LIFESTYLE ITEMS": [
+      "Gift Hampers",
+      "Gift Boxes",
+      "Birthday Gifts",
+      "Valentine's Gifts",
+      "Anniversary Gifts",
+      "Couple Gifts",
+      "Mother's Day Gifts",
+      "Father's Day Gifts",
+      "Personalized Gifts",
+      "Self-Care Gift Sets",
+      "Home Décor",
+      "Travel Accessories",
+      "Handbags & Purses",
+      "Wallets",
+      "Keyholders"
+    ],
+    "CUTE LIFESTYLE ACCESSORIES": [
+      "Watches",
+      "Women's Watches",
+      "Men's Watches",
+      "Unisex Watches",
+      "Couple Watches",
+      "Smart Watches",
+      "Fashion Watches",
+      "Luxury Watches",
+      "Watch & Jewellery Sets",
+      "Watch Accessories"
+    ],
+    "DUVETS & DUVET COVERS": [
+      "Single Duvets",
+      "Double Duvets",
+      "King Size Duvets",
+      "Super King Size Duvets",
+      "Duvet Covers",
+      "Complete Bedding Sets",
+      "Bedsheets",
+      "Pillowcases",
+      "Blankets",
+      "Comforters",
+      "Bed Runners",
+      "Kids' Bedding",
+      "Luxury Bedding Sets"
+    ],
+    "COFFEE CUPS": [
+      "Ceramic Mugs",
+      "Glass Cups",
+      "Travel Mugs",
+      "Insulated Cups",
+      "Coffee Cups with Lids",
+      "Personalized Mugs",
+      "Couple Mugs",
+      "Office Mugs",
+      "Cute/Decorative Mugs",
+      "Coffee Cup Gift Sets"
+    ],
+    "STANLEY CUPS": [
+      "Stanley Tumblers",
+      "Stanley Quenchers",
+      "Travel Tumblers",
+      "Insulated Bottles",
+      "Water Bottles",
+      "Stanley Accessories",
+      "Straws",
+      "Straw Covers",
+      "Cup Holders",
+      "Cleaning Brushes",
+      "Tumbler Bags"
+    ],
+    "KITCHEN APPLIANCES": [
+      "Blenders",
+      "Air Fryers",
+      "Electric Kettles",
+      "Microwaves",
+      "Toasters",
+      "Sandwich Makers",
+      "Electric Pressure Cookers",
+      "Rice Cookers",
+      "Coffee Makers",
+      "Juicers",
+      "Food Processors",
+      "Hand Mixers",
+      "Electric Grills",
+      "Hot Plates",
+      "Choppers",
+      "Kitchen Scales"
+    ],
+    "WASHING MACHINES": [
+      "Twin-Tub Washing Machines",
+      "Fully Automatic Washing Machines",
+      "Front Load Washing Machines",
+      "Top Load Washing Machines",
+      "Portable Washing Machines",
+      "Mini Washing Machines",
+      "Washing Machine Accessories"
+    ],
+    "KITCHENWARE": [
+      "Plates",
+      "Bowls",
+      "Cups & Mugs",
+      "Glassware",
+      "Cutlery",
+      "Spoons & Forks",
+      "Pots & Pans",
+      "Cooking Utensils",
+      "Serving Dishes",
+      "Serving Trays",
+      "Food Storage Containers",
+      "Spice Jars",
+      "Water Bottles",
+      "Lunch Boxes",
+      "Chopping Boards",
+      "Knives",
+      "Kitchen Organizers",
+      "Dish Racks",
+      "Baking Equipment",
+      "Kitchen Accessories"
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+<main class="product-page">
+  <div>
+    <div class="detail-image"><img src="{{image}}" alt="{{name}}"></div>
+    <div class="thumbnails">{{gallery}}</div>
+  </div>
+  <section class="detail-copy">
+    <p class="eyebrow">{{category}} / {{brand}}</p>
+    <h1>{{name}}</h1>
+    <p class="rating">★ {{rating}} · {{review_count}} reviews</p>
+    <p class="detail-price">{{price}} {{original}} {{discount}}</p>
+    <p class="hero-text">{{description}}</p>
+    <p class="stock">{{stock_message}}</p>
+    {{purchase}}
+    <div class="product-links">{{product_links}}</div>
+    <h3>Specifications</h3>
+    <ul class="specs">{{specifications}}</ul>
+    <h3>Reviews</h3>
+    {{reviews}}
+    {{review_form}}
+    <section class="related-products">
+      <p class="eyebrow">YOU MAY ALSO LIKE</p>
+      <div class="product-grid">{{related_products}}</div>
+    </section>
+  </section>
+</main>

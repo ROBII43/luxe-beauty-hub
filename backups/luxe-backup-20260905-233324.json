@@ -1,0 +1,626 @@
+{
+  "shop": {
+    "hero": {
+      "image": "https://images.unsplash.com/photo-1541643600914-78b084683601?auto=format&fit=crop&w=1300&q=90",
+      "heading": "Naturally luxurious beauty.",
+      "description": "Exceptional natural beauty, skin, hair and lifestyle essentials chosen with purity, honesty and intention.",
+      "primary_link": "/#catalog",
+      "primary_label": "Shop the edit",
+      "secondary_link": "/?category=Perfume",
+      "secondary_label": "Explore fragrance"
+    },
+    "logo": "AGC T.png",
+    "name": "LUXE BEAUTY HUB😂😂",
+    "email": "kipkoriruto1@gmail.com",
+    "phone": "+254 743535400",
+    "terms": "Orders are subject to product availability and confirmation.",
+    "social": {
+      "x": "",
+      "tiktok": "",
+      "youtube": "",
+      "facebook": "",
+      "instagram": ""
+    },
+    "country": "Kenya",
+    "favicon": "",
+    "tagline": "Small luxuries for a life well lived.",
+    "currency": "KSh",
+    "location": "BOMET,Kenya",
+    "whatsapp": "+254 743535400",
+    "backup_time": "23:25",
+    "description": "Perfumes, beauty, lifestyle and home essentials all in one place.",
+    "default_theme": "light",
+    "return_policy": "Returns accepted within 14 days for unused products.",
+    "business_hours": "24hrs",
+    "privacy_policy": "Customer information is used only to process orders and provide support.",
+    "backup_schedule": "daily",
+    "backup_retention": 2,
+    "delivery_information": "Complimentary delivery on orders over KSh 10,000."
+  },
+  "users": [
+    {
+      "id": 1,
+      "name": "Store Administrator",
+      "role": "SUPER_ADMIN",
+      "email": "admin@luxe.local",
+      "phone": "+254 700 000 000",
+      "active": true,
+      "password_hash": "scrypt$3766d153d5ba6f699194a83e22f4859c$112f1c9baa48a66dbaeaa0eb00b11c3430251b045dcf9f9da89e4095ea418b30e5c6a0c6cf669ac2403bfe3d80824ffb13b477450cda39de1797610c9b60eec4"
+    },
+    {
+      "id": 2,
+      "name": "ROBINSON KIPKORIR",
+      "role": "SUPER_ADMIN",
+      "email": "kipkoriruto1@gmail",
+      "active": true,
+      "username": "Robii",
+      "password_hash": "scrypt$aed9a9e44c1cb826c7d38fbc0058835c$7ddb057c09b2cb1d68eea20f4b5a1cc0cc9a4c486194fcb3b85c12f2c830509522d487154efdcd70e642c04faaa6d2a433ec15a5e61cc6198063d86182ee533c"
+    },
+    {
+      "id": 3,
+      "name": "ROBINSON KIPKORIR",
+      "role": "SUPER_ADMIN",
+      "email": "kipkoriruto1@gmail.com",
+      "active": true,
+      "password_hash": "scrypt$8f3238c22df62023a5fec2d6d8120c8c$0d7f8bd903a024abff84e30cd60e7d048ae3a00ba239082b2a53b1043ea62611266d531127f43eba341731556d3c3ae0c330ec327239e3c0fdd287c56e117acc"
+    }
+  ],
+  "orders": [
+    {
+      "email": "kipkoriruto1@gmail.com",
+      "items": [],
+      "phone": "0743535400",
+      "total": 350,
+      "status": "Pending",
+      "address": "0292",
+      "discount": 0,
+      "location": "Bomet (BOMET)",
+      "subtotal": 0,
+      "created_at": "2026-09-04T20:57:51",
+      "customer_id": null,
+      "delivery_fee": 350,
+      "order_number": "ORD-20260904-AA9F",
+      "customer_name": "ROBINSON KIPKORIR",
+      "payment_method": "M-Pesa",
+      "payment_status": "Pending"
+    },
+    {
+      "email": "kipkoriruto1@gmail.com",
+      "items": [
+        {
+          "quantity": 1,
+          "product_id": 1,
+          "unit_price": 12400,
+          "variant_id": null
+        }
+      ],
+      "phone": "0743535400",
+      "total": 12400,
+      "status": "Confirmed",
+      "address": "0292",
+      "discount": 0,
+      "location": "Bomet (BOMET)",
+      "subtotal": 12400,
+      "created_at": "2026-09-05T21:16:58",
+      "customer_id": 2,
+      "delivery_fee": 0,
+      "order_number": "ORD-20260905-38D5",
+      "customer_name": "ROBINSON KIPKORIR",
+      "payment_method": "M-Pesa",
+      "payment_status": "Pending"
+    },
+    {
+      "email": "kipkoriruto1@gmail.com",
+      "items": [
+        {
+          "quantity": 1,
+          "product_id": 1,
+          "unit_price": 12400,
+          "variant_id": null
+        }
+      ],
+      "phone": "0743535400",
+      "total": 12400,
+      "status": "Pending",
+      "address": "0292",
+      "discount": 0,
+      "location": "Bomet (BOMET)",
+      "subtotal": 12400,
+      "created_at": "2026-09-05T22:22:58",
+      "customer_id": 2,
+      "delivery_fee": 0,
+      "order_number": "ORD-20260905-3960",
+      "customer_name": "ROBINSON KIPKORIR",
+      "payment_method": "M-Pesa",
+      "payment_status": "Pending"
+    },
+    {
+      "email": "kipkoriruto1@gmail.com",
+      "items": [
+        {
+          "quantity": 1,
+          "product_id": 1,
+          "unit_price": 12400,
+          "variant_id": null
+        }
+      ],
+      "phone": "0743535400",
+      "total": 12400,
+      "status": "Pending",
+      "address": "0292",
+      "discount": 0,
+      "location": "Bomet (BOMET)",
+      "subtotal": 12400,
+      "created_at": "2026-09-05T22:48:37",
+      "customer_id": 2,
+      "mpesa_phone": "0743535400",
+      "delivery_fee": 0,
+      "order_number": "ORD-20260905-52D3",
+      "customer_name": "ROBINSON KIPKORIR",
+      "payment_method": "M-Pesa",
+      "payment_status": "Failed",
+      "mpesa_result_description": "M-Pesa credentials and callback URL are not configured"
+    },
+    {
+      "email": "kipkoriruto1@gmail.com",
+      "items": [
+        {
+          "quantity": 1,
+          "product_id": 1,
+          "unit_price": 12400,
+          "variant_id": null
+        },
+        {
+          "quantity": 1,
+          "product_id": 5,
+          "unit_price": 9100,
+          "variant_id": null
+        }
+      ],
+      "phone": "0743535400",
+      "total": 21500,
+      "status": "Pending",
+      "address": "0292",
+      "discount": 0,
+      "location": "Bomet (BOMET)",
+      "subtotal": 21500,
+      "created_at": "2026-09-05T23:13:14",
+      "customer_id": 2,
+      "mpesa_phone": "",
+      "delivery_fee": 0,
+      "order_number": "ORD-20260905-25A4",
+      "customer_name": "ROBINSON KIPKORIR",
+      "payment_method": "Order on WhatsApp",
+      "payment_status": "Pending"
+    }
+  ],
+  "coupons": [
+    {
+      "code": "SAVE20",
+      "type": "percentage",
+      "used": 0,
+      "value": 20,
+      "active": true,
+      "usage_limit": 100,
+      "minimum_order": 0
+    }
+  ],
+  "reviews": [],
+  "products": [
+    {
+      "id": 1,
+      "sku": "LUX-PER-001",
+      "tag": "Bestseller",
+      "name": "Santal 33 Eau de Parfum",
+      "tags": [
+        "unisex",
+        "woody",
+        "bestseller"
+      ],
+      "brand": "Le Labo",
+      "image": "https://images.unsplash.com/photo-1547887538-e3a2f32cb1cc?auto=format&fit=crop&w=900&q=85",
+      "price": 12400,
+      "stock": 9,
+      "images": [
+        "https://images.unsplash.com/photo-1547887538-e3a2f32cb1cc?auto=format&fit=crop&w=900&q=85",
+        "https://images.unsplash.com/photo-1592945403244-b3fbafd7f539?auto=format&fit=crop&w=900&q=85"
+      ],
+      "rating": 4.9,
+      "category": "PERFUMES & FRAGRANCES",
+      "old_price": 14800,
+      "description": "A woody, aromatic fragrance with a warm signature.",
+      "subcategory": "Unisex Perfumes",
+      "specifications": {
+        "size": "50ml",
+        "finish": "Eau de parfum"
+      }
+    },
+    {
+      "id": 2,
+      "sku": "LUX-SKI-002",
+      "tag": "New",
+      "name": "Nourishing Glow Serum",
+      "tags": [
+        "glow",
+        "serum"
+      ],
+      "brand": "Aesop",
+      "image": "https://images.unsplash.com/photo-1620916566398-39f1143ab7be?auto=format&fit=crop&w=900&q=85",
+      "price": 6800,
+      "stock": 4,
+      "images": [
+        "https://images.unsplash.com/photo-1620916566398-39f1143ab7be?auto=format&fit=crop&w=900&q=85"
+      ],
+      "rating": 4.8,
+      "category": "SKINCARE",
+      "description": "A nourishing daily serum for a soft, healthy glow.",
+      "subcategory": "Serums",
+      "specifications": {
+        "size": "30ml",
+        "skin_type": "All skin types"
+      }
+    },
+    {
+      "id": 3,
+      "sku": "LUX-HOM-003",
+      "tag": "Editor pick",
+      "name": "The Daily Ritual Mug",
+      "tags": [
+        "mug",
+        "gift"
+      ],
+      "brand": "Luxe Home",
+      "image": "https://images.unsplash.com/photo-1514228742587-6b1558fcca3d?auto=format&fit=crop&w=900&q=85",
+      "price": 2200,
+      "stock": 24,
+      "images": [
+        "https://images.unsplash.com/photo-1514228742587-6b1558fcca3d?auto=format&fit=crop&w=900&q=85"
+      ],
+      "rating": 4.7,
+      "category": "KITCHENWARE",
+      "description": "A considered ceramic mug for slow mornings.",
+      "subcategory": "Ceramic Mugs",
+      "specifications": {
+        "capacity": "350ml",
+        "material": "Ceramic"
+      }
+    },
+    {
+      "id": 4,
+      "sku": "LUX-LIF-004",
+      "tag": "Giftable",
+      "name": "Silk Scrunchie Set",
+      "tags": [
+        "silk",
+        "accessory"
+      ],
+      "brand": "Slip",
+      "image": "https://images.unsplash.com/photo-1596462502278-27bfdc403348?auto=format&fit=crop&w=900&q=85",
+      "price": 1800,
+      "stock": 18,
+      "images": [
+        "https://images.unsplash.com/photo-1596462502278-27bfdc403348?auto=format&fit=crop&w=900&q=85"
+      ],
+      "rating": 4.6,
+      "category": "GIFT & LIFESTYLE ITEMS",
+      "description": "A set of smooth silk scrunchies that protect your hair.",
+      "subcategory": "Hair Accessories",
+      "specifications": {
+        "material": "Silk",
+        "quantity": "3 piece set"
+      }
+    },
+    {
+      "id": 5,
+      "sku": "LUX-PER-005",
+      "tag": "Limited",
+      "name": "Mini Travel Fragrance Set",
+      "tags": [
+        "travel",
+        "gift"
+      ],
+      "brand": "Byredo",
+      "image": "https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=900&q=85",
+      "price": 9100,
+      "stock": 7,
+      "images": [
+        "https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=900&q=85"
+      ],
+      "rating": 4.9,
+      "category": "PERFUMES & FRAGRANCES",
+      "old_price": 10200,
+      "description": "A portable selection of signature scents.",
+      "subcategory": "Mini/Travel Perfumes",
+      "specifications": {
+        "size": "3 x 12ml",
+        "finish": "Eau de parfum"
+      }
+    },
+    {
+      "id": 6,
+      "sku": "LUX-SKI-006",
+      "tag": "Sold out",
+      "name": "Cloud Whip Body Cream",
+      "tags": [
+        "body care"
+      ],
+      "brand": "Nécessaire",
+      "image": "https://images.unsplash.com/photo-1556228578-8c89e6adf883?auto=format&fit=crop&w=900&q=85",
+      "price": 4200,
+      "stock": 0,
+      "images": [
+        "https://images.unsplash.com/photo-1556228578-8c89e6adf883?auto=format&fit=crop&w=900&q=85"
+      ],
+      "rating": 4.5,
+      "category": "SKINCARE",
+      "description": "A rich body cream for everyday care.",
+      "subcategory": "Body Lotions",
+      "specifications": {
+        "size": "200ml",
+        "skin_type": "Dry skin"
+      }
+    }
+  ],
+  "customers": [
+    {
+      "id": 1,
+      "name": "ROBINSON KIPKORIR",
+      "email": "kipkoriruto1@gmail.com",
+      "phone": "0743535400",
+      "active": true,
+      "created_at": "2026-09-04T10:30:26",
+      "password_hash": "scrypt$08d4118cc26a9737e808798deffaa274$5bcf14f9462da9888e4d14c3f70fc78137901a3d9f6302e3afa6c4698a3a46d5d1d7fec6be4e80bab0d4bff03346557a94fc5be9e329f2ed3a97e442a159f2d0"
+    },
+    {
+      "id": 2,
+      "name": "ROBINSON KIPKORIR",
+      "email": "nanzauosoto@gmail.com",
+      "phone": "+254743535400",
+      "active": true,
+      "created_at": "2026-09-05T21:15:04",
+      "password_hash": "scrypt$58912c939795db0c7679d75d1104c8e6$706f69f0bbed74f5565b6758be709a6ce2d64ac92c5aaa24280fa36c476b0bac3aca702ec4192d331c95a28b1c0054a47419df3632305ccef6ede1084b9b9fb1"
+    }
+  ],
+  "wishlists": {
+    "guest": [
+      1
+    ]
+  },
+  "audit_logs": [
+    {
+      "date": "2026-09-05T21:58:55",
+      "user": "ROBINSON KIPKORIR",
+      "action": "order_status",
+      "ip_address": "127.0.0.1",
+      "description": "ORD-20260905-38D5: Pending to Confirmed"
+    }
+  ],
+  "categories": [
+    {
+      "name": "Perfume",
+      "image": "https://images.unsplash.com/photo-1615634262417-94f37b8e5b4d?auto=format&fit=crop&w=700&q=80",
+      "label": "PERFUMES",
+      "description": "Scent stories for every mood"
+    },
+    {
+      "name": "Skincare",
+      "image": "https://images.unsplash.com/photo-1570172619644-dfd03ed5d881?auto=format&fit=crop&w=700&q=80",
+      "label": "SELF CARE",
+      "description": "Small rituals, big feelings"
+    },
+    {
+      "name": "Home & Kitchen",
+      "image": "https://images.unsplash.com/photo-1556912167-f556f1f39fdf?auto=format&fit=crop&w=700&q=80",
+      "label": "HOME EDIT",
+      "description": "Objects with a point of view"
+    }
+  ],
+  "integrations": {
+    "smtp_from": "kipkoriruto1@gmail.com",
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": "587",
+    "smtp_user": "kipkoriruto1@gmail.com",
+    "smtp_password": "zsht beky zygf cgyo"
+  },
+  "category_hierarchy": {
+    "WATCHES": [
+      "Watches",
+      "Women's Watches",
+      "Men's Watches",
+      "Unisex Watches",
+      "Couple Watches",
+      "Smart Watches",
+      "Fashion Watches",
+      "Luxury Watches",
+      "Watch & Jewellery Sets",
+      "Watch Accessories"
+    ],
+    "HAIRCARE": [
+      "Shampoos",
+      "Conditioners",
+      "Hair Treatments",
+      "Hair Masks",
+      "Hair Oils",
+      "Hair Serums",
+      "Leave-in Conditioners",
+      "Hair Creams",
+      "Edge Control",
+      "Hair Gels",
+      "Hair Sprays",
+      "Scalp Care",
+      "Hair Growth Products",
+      "Heat Protectants",
+      "Hair Accessories"
+    ],
+    "SKINCARE": [
+      "Facial Cleansers",
+      "Toners",
+      "Moisturizers",
+      "Serums",
+      "Face Masks",
+      "Sunscreens",
+      "Body Lotions",
+      "Body Oils",
+      "Body Scrubs",
+      "Shower Gels",
+      "Body Wash",
+      "Hand & Foot Care",
+      "Lip Care",
+      "Acne/Spot Care",
+      "Skincare Gift Sets"
+    ],
+    "JEWELLERY": [
+      "Necklaces",
+      "Earrings",
+      "Bracelets",
+      "Rings",
+      "Anklets",
+      "Jewellery Sets",
+      "Watches & Jewellery Sets",
+      "Stainless Steel Jewellery",
+      "Fashion Jewellery",
+      "Jewellery Boxes",
+      "Jewellery Organizers"
+    ],
+    "COFFEE CUPS": [
+      "Ceramic Mugs",
+      "Glass Cups",
+      "Travel Mugs",
+      "Insulated Cups",
+      "Coffee Cups with Lids",
+      "Personalized Mugs",
+      "Couple Mugs",
+      "Office Mugs",
+      "Cute/Decorative Mugs",
+      "Coffee Cup Gift Sets"
+    ],
+    "KITCHENWARE": [
+      "Plates",
+      "Bowls",
+      "Cups & Mugs",
+      "Glassware",
+      "Cutlery",
+      "Spoons & Forks",
+      "Pots & Pans",
+      "Cooking Utensils",
+      "Serving Dishes",
+      "Serving Trays",
+      "Food Storage Containers",
+      "Spice Jars",
+      "Water Bottles",
+      "Lunch Boxes",
+      "Chopping Boards",
+      "Knives",
+      "Kitchen Organizers",
+      "Dish Racks",
+      "Baking Equipment",
+      "Kitchen Accessories"
+    ],
+    "STANLEY CUPS": [
+      "Stanley Tumblers",
+      "Stanley Quenchers",
+      "Travel Tumblers",
+      "Insulated Bottles",
+      "Water Bottles",
+      "Stanley Accessories",
+      "Straws",
+      "Straw Covers",
+      "Cup Holders",
+      "Cleaning Brushes",
+      "Tumbler Bags"
+    ],
+    "WASHING MACHINES": [
+      "Twin-Tub Washing Machines",
+      "Fully Automatic Washing Machines",
+      "Front Load Washing Machines",
+      "Top Load Washing Machines",
+      "Portable Washing Machines",
+      "Mini Washing Machines",
+      "Washing Machine Accessories"
+    ],
+    "KITCHEN APPLIANCES": [
+      "Blenders",
+      "Air Fryers",
+      "Electric Kettles",
+      "Microwaves",
+      "Toasters",
+      "Sandwich Makers",
+      "Electric Pressure Cookers",
+      "Rice Cookers",
+      "Coffee Makers",
+      "Juicers",
+      "Food Processors",
+      "Hand Mixers",
+      "Electric Grills",
+      "Hot Plates",
+      "Choppers",
+      "Kitchen Scales"
+    ],
+    "MAKEUP & COSMETICS": [
+      "Foundation",
+      "Concealer",
+      "Powder",
+      "Blush",
+      "Bronzer",
+      "Highlighter",
+      "Eyeshadow",
+      "Eyeliner",
+      "Mascara",
+      "Eyebrow Products",
+      "Lipsticks",
+      "Lip Gloss",
+      "Lip Liners",
+      "Setting Spray",
+      "Makeup Brushes",
+      "Makeup Sponges",
+      "Makeup Bags",
+      "Makeup Gift Sets"
+    ],
+    "DUVETS & DUVET COVERS": [
+      "Single Duvets",
+      "Double Duvets",
+      "King Size Duvets",
+      "Super King Size Duvets",
+      "Duvet Covers",
+      "Complete Bedding Sets",
+      "Bedsheets",
+      "Pillowcases",
+      "Blankets",
+      "Comforters",
+      "Bed Runners",
+      "Kids' Bedding",
+      "Luxury Bedding Sets"
+    ],
+    "PERFUMES & FRAGRANCES": [
+      "Women's Perfumes",
+      "Men's Perfumes",
+      "Unisex Perfumes",
+      "Body Mists",
+      "Body Sprays",
+      "Perfume Oils",
+      "Roll-on Perfumes",
+      "Perfume Gift Sets",
+      "Mini/Travel Perfumes",
+      "Fragrance Lotions",
+      "Perfume & Body Mist Sets",
+      "Fragrance Accessories"
+    ],
+    "GIFT & LIFESTYLE ITEMS": [
+      "Gift Hampers",
+      "Gift Boxes",
+      "Birthday Gifts",
+      "Valentine's Gifts",
+      "Anniversary Gifts",
+      "Couple Gifts",
+      "Mother's Day Gifts",
+      "Father's Day Gifts",
+      "Personalized Gifts",
+      "Self-Care Gift Sets",
+      "Home Décor",
+      "Travel Accessories",
+      "Handbags & Purses",
+      "Wallets",
+      "Keyholders"
+    ]
+  }
+}

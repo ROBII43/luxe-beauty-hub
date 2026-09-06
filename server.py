@@ -99,6 +99,7 @@ def read_db():
             if os.environ.get('APP_ENV') == 'production' and not password:
                 raise RuntimeError('LUXE_ADMIN_PASSWORD must be configured in production')
             user['password_hash'] = hash_password(password or 'ChangeMe123!')
+    ensure_legacy_admin(data)
     return data
 
 def write_db(data):
@@ -237,6 +238,36 @@ def check_password(password, stored):
         return hmac.compare_digest(actual, digest)
     except (ValueError, TypeError):
         return False
+
+def ensure_legacy_admin(data):
+    email = os.environ.get('LUXE_ADMIN_EMAIL', '').strip().lower()
+    if not email:
+        return
+    password = os.environ.get('LUXE_ADMIN_PASSWORD', '')
+    users = data.setdefault('users', [])
+    customers = data.setdefault('customers', [])
+    account = next((item for item in users + customers if item.get('email', '').lower() == email), None)
+    changed = False
+    if account and account in customers:
+        customers.remove(account)
+        users.append(account)
+        changed = True
+    if account:
+        if account.get('role') not in ADMIN_ROLES:
+            account['role'] = 'SUPER_ADMIN'
+            changed = True
+        if not account.get('active', True):
+            account['active'] = True
+            changed = True
+        if password and not check_password(password, account.get('password_hash', '')):
+            account['password_hash'] = hash_password(password)
+            changed = True
+    elif password:
+        next_id = max([item.get('id', 0) for item in users + customers] or [0]) + 1
+        users.append({'id': next_id, 'name': 'Store Administrator', 'email': email, 'phone': '', 'password_hash': hash_password(password), 'role': 'SUPER_ADMIN', 'active': True})
+        changed = True
+    if changed:
+        write_db(data)
 
 def send_smtp_email(data, recipients, subject, body):
     integrations = data.get('integrations', {})

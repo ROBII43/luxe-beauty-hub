@@ -41,7 +41,7 @@ Phase status:
 - Phase 5: public database-backed catalogue and category reads with pagination, search, filters, sorting, and product details.
 - The legacy storefront remains the production-facing application until migrated routes have equivalent coverage.
 
-Set `LUXE_ADMIN_PASSWORD` before deployment. MySQL settings are documented in `.env.example`; apply `schema.sql` to the `luxe` database before starting the app. The server reads `HOST` and `PORT` from the hosting platform and binds to `0.0.0.0` by default.
+Set `LUXE_ADMIN_EMAIL` and `LUXE_ADMIN_PASSWORD` before deployment. The legacy storefront bootstraps that account on startup: an existing matching customer is promoted to `SUPER_ADMIN`, otherwise a new admin account is created. MySQL settings are documented in `.env.example`; apply `schema.sql` to the `luxe` database before starting the app. The server reads `HOST` and `PORT` from the hosting platform and binds to `0.0.0.0` by default.
 
 ## Production release checklist
 

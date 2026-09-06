@@ -1393,18 +1393,49 @@ class Store(BaseHTTPRequestHandler):
         secure = '; Secure' if self.secure_cookie() else ''
         self.send_response(303); self.send_header('Location', destination); self.send_header('Set-Cookie', f'luxe_session={self.session_token}; HttpOnly; SameSite=Lax; Max-Age={SESSION_MAX_SECONDS}; Path=/{secure}'); self.send_header('Cache-Control', 'no-store'); self.end_headers()
 
-if __name__ == '__main__':
-    if '--backup-once' in sys.argv:
-        run_backup_once()
-        raise SystemExit(0)
-    (ROOT / 'uploads').mkdir(exist_ok=True)
-    host = os.environ.get('HOST', '0.0.0.0')
-    port = int(os.environ.get('PORT', '8000'))
-    if os.name == 'nt':
+if __name__ == "__main__":
+    # Run a single backup and exit.
+    if "--backup-once" in sys.argv:
         try:
-            data = read_db(); apply_windows_backup_schedule(data.get('shop', {}))
-        except Exception:
-            pass
-    print(f'Luxe Beauty Hub: http://{host}:{port}')
-    threading.Thread(target=scheduled_backup_loop, daemon=True, name='scheduled-backups').start()
-    BoundedThreadingHTTPServer((host, port), Store).serve_forever()
+            run_backup_once()
+            print("Backup completed successfully.")
+        except Exception as exc:
+            print(f"Backup failed: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+
+        raise SystemExit(0)
+
+    # Ensure the uploads directory exists.
+    (ROOT / "uploads").mkdir(parents=True, exist_ok=True)
+
+    # Render provides the PORT environment variable.
+    # The local default remains port 8000.
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+
+    # Apply the Windows backup schedule only when running on Windows.
+    if os.name == "nt":
+        try:
+            data = read_db()
+            apply_windows_backup_schedule(data.get("shop", {}))
+        except Exception as exc:
+            print(f"Could not apply Windows backup schedule: {exc}")
+
+    print(f"Luxe Beauty Hub: http://{host}:{port}")
+
+    # Run scheduled backups in the background.
+    threading.Thread(
+        target=scheduled_backup_loop,
+        daemon=True,
+        name="scheduled-backups",
+    ).start()
+
+    # Start the production HTTP server.
+    server = BoundedThreadingHTTPServer((host, port), Store)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down Luxe Beauty Hub...")
+    finally:
+        server.server_close()

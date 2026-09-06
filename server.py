@@ -905,6 +905,29 @@ class Store(BaseHTTPRequestHandler):
         if not product: return send_json(self, {'error': 'Product not found'}, 404)
         data['products'].remove(product); audit(data, session, 'product_delete', f'{product["name"]} deleted via API'); write_db(data); return send_json(self, {'deleted': product['id']})
 
+    def do_HEAD(self):
+        """
+        Handle HEAD requests used by Render health checks
+        and web clients.
+
+        HEAD returns the same headers as GET but without
+        sending the response body.
+        """
+        try:
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "text/html; charset=utf-8"
+            )
+            self.send_header(
+                "Cache-Control",
+                "no-cache"
+            )
+            self.end_headers()
+
+        except BrokenPipeError:
+            pass
+
     def do_GET(self):
         if self.rate_limited(): return self.send_error(429, 'Please slow down and try again.')
         parsed = urlparse(self.path); data = read_db(); session = self.session()
@@ -1394,7 +1417,13 @@ class Store(BaseHTTPRequestHandler):
         self.send_response(303); self.send_header('Location', destination); self.send_header('Set-Cookie', f'luxe_session={self.session_token}; HttpOnly; SameSite=Lax; Max-Age={SESSION_MAX_SECONDS}; Path=/{secure}'); self.send_header('Cache-Control', 'no-store'); self.end_headers()
 
 if __name__ == "__main__":
-    # Run a single backup and exit.
+    # ---------------------------------------------------------
+    # ONE-TIME BACKUP MODE
+    # ---------------------------------------------------------
+    # Run:
+    #     python server.py --backup-once
+    #
+    # This performs one backup and exits.
     if "--backup-once" in sys.argv:
         try:
             run_backup_once()
@@ -1405,37 +1434,133 @@ if __name__ == "__main__":
 
         raise SystemExit(0)
 
-    # Ensure the uploads directory exists.
-    (ROOT / "uploads").mkdir(parents=True, exist_ok=True)
+    # ---------------------------------------------------------
+    # ENSURE REQUIRED DIRECTORIES EXIST
+    # ---------------------------------------------------------
+    uploads_dir = ROOT / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---------------------------------------------------------
+    # RENDER PORT CONFIGURATION
+    # ---------------------------------------------------------
+    #
     # Render provides the PORT environment variable.
-    # The local default remains port 8000.
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8000"))
+    #
+    # IMPORTANT:
+    # - Bind to 0.0.0.0, NOT 127.0.0.1
+    # - Use Render's PORT in production
+    # - Use 8000 locally if PORT is not defined
+    #
+    # Render:
+    #     HOST=0.0.0.0
+    #     PORT=<Render supplied port>
+    #
+    # Local:
+    #     HOST=0.0.0.0
+    #     PORT=8000
+    #
+    host = os.environ.get("HOST", "0.0.0.0").strip()
 
-    # Apply the Windows backup schedule only when running on Windows.
+    # Never allow localhost binding in production.
+    if os.environ.get("APP_ENV", "").lower() == "production":
+        host = "0.0.0.0"
+
+    try:
+        port = int(os.environ.get("PORT", "8000"))
+    except ValueError:
+        print(
+            "ERROR: PORT environment variable must be a valid integer.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    # Validate the port.
+    if not (1 <= port <= 65535):
+        print(
+            f"ERROR: Invalid PORT value: {port}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    # ---------------------------------------------------------
+    # WINDOWS BACKUP SCHEDULE
+    # ---------------------------------------------------------
+    #
+    # Render runs Linux, so this only applies locally on Windows.
+    #
     if os.name == "nt":
         try:
             data = read_db()
-            apply_windows_backup_schedule(data.get("shop", {}))
+            apply_windows_backup_schedule(
+                data.get("shop", {})
+            )
         except Exception as exc:
-            print(f"Could not apply Windows backup schedule: {exc}")
+            print(
+                f"Could not apply Windows backup schedule: {exc}",
+                file=sys.stderr,
+            )
 
-    print(f"Luxe Beauty Hub: http://{host}:{port}")
+    # ---------------------------------------------------------
+    # STARTUP INFORMATION
+    # ---------------------------------------------------------
+    print("=" * 60)
+    print("LUXE BEAUTY HUB")
+    print("=" * 60)
+    print(f"Environment : {os.environ.get('APP_ENV', 'development')}")
+    print(f"Host        : {host}")
+    print(f"Port        : {port}")
+    print(f"Uploads     : {uploads_dir}")
+    print(f"Server URL  : http://{host}:{port}")
+    print("=" * 60)
 
-    # Run scheduled backups in the background.
+    # ---------------------------------------------------------
+    # SCHEDULED BACKUP THREAD
+    # ---------------------------------------------------------
+    #
+    # Runs in the background without blocking the web server.
+    #
     threading.Thread(
         target=scheduled_backup_loop,
         daemon=True,
         name="scheduled-backups",
     ).start()
 
-    # Start the production HTTP server.
-    server = BoundedThreadingHTTPServer((host, port), Store)
+    # ---------------------------------------------------------
+    # START HTTP SERVER
+    # ---------------------------------------------------------
+    #
+    # BoundedThreadingHTTPServer should be your existing server
+    # class, and Store should be your existing request handler.
+    #
+    # IMPORTANT FOR RENDER:
+    #     ("0.0.0.0", port)
+    #
+    # Do NOT use:
+    #     ("127.0.0.1", 8000)
+    #
+    server = BoundedThreadingHTTPServer(
+        ("0.0.0.0", port),
+        Store,
+    )
+
+    print(
+        f"Luxe Beauty Hub server listening on "
+        f"0.0.0.0:{port}"
+    )
 
     try:
         server.serve_forever()
+
     except KeyboardInterrupt:
         print("\nShutting down Luxe Beauty Hub...")
+
+    except Exception as exc:
+        print(
+            f"Server stopped because of an error: {exc}",
+            file=sys.stderr,
+        )
+        raise
+
     finally:
         server.server_close()
+        print("Luxe Beauty Hub server closed.")

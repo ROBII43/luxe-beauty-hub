@@ -347,6 +347,29 @@ def reset_password_page(data, email, message=''):
 def is_admin_role(role):
     return role in ADMIN_ROLES
 
+def is_superadmin_role(role):
+    return role in {'SUPER_ADMIN', 'SUPERADMIN'}
+def online_account_emails():
+    now = time.time()
+    return {
+        session.get('email', '').strip().lower()
+        for session in SESSIONS.values()
+        if session.get('email') and now - session.get('last_seen', now) <= SESSION_IDLE_SECONDS
+    }
+
+def validate_backup(value):
+    if isinstance(value, bytes):
+        value = value.decode('utf-8-sig')
+    if isinstance(value, str):
+        value = json.loads(value.lstrip('\ufeff'))
+    if not isinstance(value, dict) or not isinstance(value.get('products'), list) or not isinstance(value.get('shop'), dict):
+        raise ValueError('Backup must contain products and shop data')
+    value.setdefault('users', [])
+    value.setdefault('customers', [])
+    value.setdefault('orders', [])
+    value.setdefault('categories', [])
+    return value
+
 def normalize_mpesa_phone(phone):
     digits = ''.join(character for character in phone if character.isdigit())
     if digits.startswith('0'):
@@ -439,11 +462,13 @@ def valid_image_upload(filename, content_type, size):
 def parse_form(content_type, raw):
     if not content_type.startswith('multipart/form-data'):
         return parse_qs(raw.decode('utf-8', errors='replace'))
-    boundary = content_type.split('boundary=', 1)[-1].strip().encode()
+    boundary = content_type.split('boundary=', 1)[-1].strip().strip('"').encode()
     fields = {}
     for part in raw.split(b'--' + boundary):
         if b'\r\n\r\n' not in part: continue
-        header_bytes, value = part.split(b'\r\n\r\n', 1); value = value.rstrip(b'\r\n-')
+        header_bytes, value = part.split(b'\r\n\r\n', 1)
+        if value.endswith(b'\r\n'):
+            value = value[:-2]
         headers = header_bytes.decode('utf-8', errors='replace')
         disposition = next((line for line in headers.split('\r\n') if line.lower().startswith('content-disposition:')), '')
         name_match = __import__('re').search(r'name="([^"]+)"', disposition)
@@ -452,7 +477,7 @@ def parse_form(content_type, raw):
         if filename_match and filename_match.group(1):
             filename = Path(filename_match.group(1)).name; content_match = __import__('re').search(r'Content-Type:\s*([^\r\n]+)', headers, __import__('re').I)
             content = content_match.group(1).strip() if content_match else ''
-            if name == 'backup_file' and content in ('application/json', 'text/plain') and 0 < len(value) <= MAX_REQUEST_BYTES:
+            if name == 'backup_file' and 0 < len(value) <= MAX_REQUEST_BYTES:
                 fields[name] = [value.decode('utf-8', errors='replace')]
                 continue
             if not valid_image_upload(filename, content, len(value)):
@@ -579,7 +604,7 @@ def admin(data, message=''):
     recent_days = sorted(sales_by_day)[-7:]
     max_sales = max([sales_by_day.get(day, 0) for day in recent_days] or [1])
     chart = ''.join(f'<div class="chart-bar"><span style="height:{max(8, round(sales_by_day.get(day, 0) / max_sales * 100))}%"></span><small>{esc(day[-5:])}</small></div>' for day in recent_days) or '<p class="note">Sales activity will appear here after the first order.</p>'
-    rows = ''.join(f'<div class="table-row"><span class="admin-product"><img src="{esc(product.get("image", ""))}" loading="lazy"><b>{esc(product.get("name", ""))}<small>{esc(product.get("sku", ""))}</small></b></span><span>{esc(product.get("category", ""))}</span><span>{money(product.get("price", 0))}</span><span>{product.get("stock", 0)}</span><span><i class="status">{"Out" if not product.get("stock") else "Low stock" if product.get("stock", 0) <= product.get("minimum_stock", 5) else "In stock"}</i></span><span><a class="under" href="/admin/products/edit?id={product.get("id")}">Edit</a></span></div>' for product in data.get('products', [])[:12]) or '<p class="empty">No products have been added yet.</p>'
+    rows = ''.join(f'<div class="table-row"><span class="admin-product"><img src="{esc(product.get("image", ""))}" loading="lazy"><b>{esc(product.get("name", ""))}<small>{esc(product.get("sku", ""))}</small></b></span><span>{esc(product.get("category", ""))}</span><span>{money(product.get("price", 0))}</span><span>{product.get("stock", 0)}</span><span><i class="status">{"Out" if not product.get("stock") else "Low stock" if product.get("stock", 0) <= product.get("minimum_stock", 5) else "In stock"}</i></span><span><a class="under" href="/admin/products/edit?id={product.get("id")}">Edit</a>{f'<form method="post" class="inline-form"><input type="hidden" name="action" value="product_delete"><input type="hidden" name="product_id" value="{product.get("id")}"><button onclick="return confirm(\'Delete this product?\')">Delete</button></form>' if is_superadmin_role(data.get("_admin_role")) else ""}</span></div>' for product in data.get('products', [])[:12]) or '<p class="empty">No products have been added yet.</p>'
     sidebar = f'''<aside class="sidebar"><div class="admin-logo">L　CONTROL<br>　 ROOM</div><p>WORKSPACE</p><a class="selected" href="/admin">▦ Dashboard</a><a href="/admin/products">□ Products <span>{len(data.get('products', []))}</span></a><a href="/admin/categories">▤ Categories <span>{len(category_groups(data))}</span></a><a href="/admin/orders">▱ Orders <span>{len(orders)}</span></a><a href="/admin/customers">♙ Customers <span>{len(data.get('customers', []))}</span></a><a href="/admin/reviews">☆ Reviews</a><p>OPERATIONS</p><a href="/admin/payments">▣ Payments</a><a href="/admin/deliveries">▰ Deliveries</a><a href="/admin/promotions">◇ Coupons & promotions</a><a href="/admin/reports">◫ Reports</a><p>SETTINGS</p><a href="/admin/settings">⚙ Shop information</a><a href="/admin/staff">♙ Users & roles</a><a href="/admin/audit">▤ Audit logs</a><a href="/admin/backup">⇩ Backup database</a><a href="/admin/restore">⇧ Restore database</a></aside>'''
     body = f'''<main class="admin-page"><div class="admin-shell">{sidebar}<section class="admin-content"><div class="section-head"><div><p class="eyebrow">BUSINESS OVERVIEW</p><h1>Good morning, <em>Admin.</em></h1></div><a class="under" href="/">View storefront ↗</a></div>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<div class="stats"><div><span>Total sales</span><b>{money(total_sales)}</b><small>All recorded orders</small></div><div><span>Today's sales</span><b>{money(today_sales)}</b><small>{today}</small></div><div><span>Pending orders</span><b>{pending}</b><small>{completed} delivered</small></div><div><span>Customers</span><b>{len(data.get('customers', []))}</b><small>{len(data.get('products', []))} products</small></div><div><span>Low stock</span><b>{low_stock}</b><small>{out_of_stock} out of stock</small></div></div><div class="admin-grid"><section class="panel sales-chart"><div class="section-head"><div><p class="eyebrow">SALES PERFORMANCE</p><h2>Recent sales</h2></div><a class="under" href="/admin/reports">View reports ↗</a></div><div class="chart-bars">{chart}</div></section><section class="panel"><p class="eyebrow">QUICK ACTIONS</p><h2>Keep things moving.</h2><div class="quick-actions"><a class="primary" href="/admin/products">Add product ↗</a><a class="under" href="/admin/orders">Review orders</a><a class="under" href="/admin/settings">Edit storefront</a></div></section></div><section class="panel"><div class="section-head"><div><p class="eyebrow">INVENTORY</p><h2>Product health</h2></div><a class="primary" href="/admin/products">Manage products ↗</a></div><div class="table"><div class="table-row table-head"><span>Product</span><span>Category</span><span>Price</span><span>Stock</span><span>Status</span><span></span></div>{rows}</div></section></section></div></main>'''
     return layout(data, body)
@@ -782,10 +807,29 @@ def admin_audit_logs(data):
 
 def admin_staff(data, message=''):
     rows = ''.join(f'<div class="table-row"><span>{esc(user.get("name", ""))}<small>{esc(user.get("email", ""))}</small></span><span>{esc(user.get("role", "STAFF"))}</span><span>{"Active" if user.get("active", True) else "Disabled"}</span><span><form method="post"><input type="hidden" name="action" value="staff_toggle"><input type="hidden" name="staff_id" value="{user.get("id", 0)}"><button>{"Disable" if user.get("active", True) else "Activate"}</button></form></span></div>' for user in data.get('users', []))
-    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / STAFF</p><h1>Staff <em>accounts.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Name</span><span>Role</span><span>Status</span></div>{rows}</div><form method="post" class="checkout-form"><input type="hidden" name="action" value="staff_create"><label>Name<input name="staff_name" required></label><label>Email<input name="staff_email" type="email" required></label><label>Temporary password<input name="staff_password" type="password" required></label><label>Role<select name="staff_role"><option>STAFF</option><option>MANAGER</option><option>ADMIN</option></select></label><button class="primary">Create staff account</button></form></section></section></main>''')
+    online_emails = online_account_emails()
+    accounts = {}
+    for account in data.get('users', []) + data.get('customers', []):
+        email = account.get('email', '').strip().lower()
+        if email:
+            accounts[email] = account
+    groups = (
+        ('SUPERADMINS', lambda account: is_superadmin_role(account.get('role'))),
+        ('ADMINS', lambda account: account.get('role') == 'ADMIN'),
+        ('USERS', lambda account: not is_admin_role(account.get('role'))),
+    )
+    can_manage = is_superadmin_role(data.get('_admin_role'))
+
+    def account_rows(accounts_for_group):
+        return ''.join(f'<div class="table-row"><span><b>{esc(account.get("name", ""))}</b><small>{esc(account.get("email", ""))}</small></span><span>{esc(account.get("role", "CUSTOMER"))}</span><span><i class="status {"online" if account.get("email", "").strip().lower() in online_emails else "offline"}">{"Online" if account.get("email", "").strip().lower() in online_emails else "Offline"}</i></span><span>{"Active" if account.get("active", True) else "Disabled"}</span><span>{f'<form method="post" class="inline-form"><input type="hidden" name="action" value="staff_toggle"><input type="hidden" name="staff_id" value="{account.get("id", 0)}"><button>{"Disable" if account.get("active", True) else "Activate"}</button></form>' if can_manage and account in data.get("users", []) and account.get("email", "").strip().lower() != data.get("_admin_email", "").lower() else ""}</span></div>' for account in accounts_for_group) or '<p class="empty">No accounts in this group.</p>'
+
+    sections = ''.join(f'<section class="panel staff-group"><div class="section-head"><div><p class="eyebrow">ACCOUNT GROUP</p><h2>{label.title()}</h2></div><span class="note">{sum(1 for account in accounts.values() if predicate(account))} accounts</span></div><div class="table"><div class="table-row table-head"><span>Name</span><span>Role</span><span>Presence</span><span>State</span><span>Action</span></div>{account_rows([account for account in accounts.values() if predicate(account)])}</div></section>' for label, predicate in groups)
+    create_form = f'<form method="post" class="checkout-form"><input type="hidden" name="action" value="staff_create"><label>Name<input name="staff_name" required></label><label>Email<input name="staff_email" type="email" required></label><label>Temporary password<input name="staff_password" type="password" required></label><label>Role<select name="staff_role"><option>STAFF</option><option>MANAGER</option><option>ADMIN</option></select></label><button class="primary">Create staff account</button></form>' if can_manage else '<p class="note">Only a superadmin can create or change managed accounts.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / USERS & ROLES</p><h1>Account <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<p class="hero-text">Live presence is based on recent activity within the current session window.</p><div class="staff-groups">{sections}</div><section class="panel"><h2>Add staff account</h2>{create_form}</section></section></main>''')
 
 def admin_restore(data, message=''):
-    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / DATABASE</p><h1>Restore a <em>backup.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="restore"><label>Backup JSON file<input name="backup_file" type="file" accept=".json,application/json" required></label><button class="primary" onclick="return confirm('Restore this database backup?')">RESTORE DATABASE</button></form><small class="note">Restoring replaces the current application state with the selected validated JSON backup.</small></section></section></main>''')
+    clear_control = '''<section class="panel danger-panel"><p class="eyebrow">SUPERADMIN ONLY</p><h2>Clear operational data</h2><p class="note">This removes products, orders, customers, payments, reviews, coupons, wishlists, and activity history. Shop settings, categories, and staff accounts are preserved.</p><form method="post" class="checkout-form" onsubmit="return confirm('This will permanently clear operational data. Continue?')"><input type="hidden" name="action" value="clear_database"><label>Type CLEAR DATABASE to confirm<input name="clear_confirmation" required autocomplete="off" pattern="CLEAR DATABASE"></label><button class="primary danger-button">CLEAR DATABASE</button></form></section>''' if is_superadmin_role(data.get('_admin_role')) else ''
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / DATABASE</p><h1>Backup & <em>restore.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="restore"><label>Backup JSON file<input name="backup_file" type="file" accept=".json,application/json" required></label><button class="primary" onclick="return confirm('Restore this database backup?')">RESTORE DATABASE</button></form><small class="note">Restoring replaces the current application state with the selected validated JSON backup.</small></section>{clear_control}</section></main>''')
 
 def admin_products(data, message=''):
     fields = [('name', 'Product name'), ('sku', 'SKU'), ('brand', 'Brand'), ('price', 'Selling price'), ('discount_price', 'Original price'), ('stock', 'Stock'), ('minimum_stock', 'Minimum stock')]
@@ -808,7 +852,27 @@ def report_csv(data, report):
     def safe(value):
         text = str(value or '')
         return "'" + text if text[:1] in ('=', '+', '-', '@') else text
-    if report == 'customers':
+    if report == 'sales':
+        totals = {}
+        for order in data.get('orders', []):
+            day = str(order.get('created_at', ''))[:10] or 'Unknown'
+            summary = totals.setdefault(day, {'orders': 0, 'revenue': 0, 'discounts': 0, 'delivery': 0})
+            summary['orders'] += 1
+            summary['revenue'] += order.get('total', 0)
+            summary['discounts'] += order.get('discount', 0)
+            summary['delivery'] += order.get('delivery_fee', 0)
+        writer.writerow(['Date', 'Orders', 'Revenue', 'Discounts', 'Delivery'])
+        for day, summary in sorted(totals.items(), reverse=True):
+            writer.writerow([day, summary['orders'], summary['revenue'], summary['discounts'], summary['delivery']])
+    elif report == 'users':
+        writer.writerow(['Name', 'Email', 'Role', 'Status', 'Created'])
+        for user in data.get('users', []):
+            writer.writerow([safe(user.get('name')), safe(user.get('email')), user.get('role', 'STAFF'), 'Active' if user.get('active', True) else 'Disabled', user.get('created_at', '')])
+    elif report == 'payments':
+        writer.writerow(['Order', 'Customer', 'Method', 'Payment status', 'Amount', 'Date'])
+        for order in data.get('orders', []):
+            writer.writerow([safe(order.get('order_number')), safe(order.get('customer_name')), safe(order.get('payment_method')), order.get('payment_status', 'Pending'), order.get('total', 0), order.get('created_at', '')])
+    elif report == 'customers':
         writer.writerow(['Customer', 'Email', 'Orders', 'Total spending'])
         for customer in data.get('customers', []):
             orders = [order for order in data.get('orders', []) if order.get('customer_id') == customer['id']]
@@ -818,11 +882,57 @@ def report_csv(data, report):
         for product in data['products']:
             status = 'OUT OF STOCK' if not product['stock'] else 'LOW STOCK' if product['stock'] <= 5 else 'IN STOCK'
             writer.writerow([safe(product.get('name')), safe(product.get('sku')), product['stock'], status])
+    elif report == 'products':
+        writer.writerow(['Product', 'SKU', 'Category', 'Price', 'Stock', 'Status'])
+        for product in data.get('products', []):
+            status = 'OUT OF STOCK' if not product.get('stock') else 'LOW STOCK' if product.get('stock', 0) <= product.get('minimum_stock', 5) else 'IN STOCK'
+            writer.writerow([safe(product.get('name')), safe(product.get('sku')), safe(product.get('category')), product.get('price', 0), product.get('stock', 0), status])
     else:
         writer.writerow(['Order', 'Customer', 'Status', 'Payment', 'Total', 'Date'])
         for order in data.get('orders', []):
             writer.writerow([safe(order.get('order_number')), safe(order.get('customer_name')), order.get('status'), safe(order.get('payment_method')), order.get('total'), order.get('created_at')])
     return output.getvalue()
+
+def report_dashboard(data, report='sales'):
+    report_types = ('sales', 'users', 'payments', 'orders', 'inventory', 'customers', 'products')
+    report = report if report in report_types else 'sales'
+    orders = data.get('orders', [])
+    revenue = sum(order.get('total', 0) for order in orders)
+    paid = sum(order.get('total', 0) for order in orders if order.get('payment_status') == 'Paid')
+    pending_payments = sum(1 for order in orders if order.get('payment_status', 'Pending') == 'Pending')
+    metrics = [('Revenue', money(revenue)), ('Orders', len(orders)), ('Users', len(data.get('users', [])) + len(data.get('customers', []))), ('Paid payments', money(paid)), ('Online now', len(online_account_emails()))]
+    if report == 'sales':
+        daily = {}
+        for order in orders:
+            day = str(order.get('created_at', ''))[:10] or 'Unknown'
+            daily.setdefault(day, {'orders': 0, 'revenue': 0})
+            daily[day]['orders'] += 1
+            daily[day]['revenue'] += order.get('total', 0)
+        headings = ('Date', 'Orders', 'Revenue')
+        records = [(day, values['orders'], money(values['revenue'])) for day, values in sorted(daily.items(), reverse=True)]
+    elif report == 'users':
+        headings = ('Name', 'Email', 'Role', 'Status')
+        records = [(user.get('name', ''), user.get('email', ''), user.get('role', 'STAFF'), 'Active' if user.get('active', True) else 'Disabled') for user in data.get('users', [])]
+    elif report == 'payments':
+        headings = ('Order', 'Customer', 'Method', 'Status', 'Amount')
+        records = [(order.get('order_number', ''), order.get('customer_name', 'Guest'), order.get('payment_method', ''), order.get('payment_status', 'Pending'), money(order.get('total', 0))) for order in reversed(orders)]
+    elif report == 'orders':
+        headings = ('Order', 'Customer', 'Status', 'Payment', 'Total')
+        records = [(order.get('order_number', ''), order.get('customer_name', 'Guest'), order.get('status', 'Pending'), order.get('payment_status', 'Pending'), money(order.get('total', 0))) for order in reversed(orders)]
+    elif report == 'inventory':
+        headings = ('Product', 'SKU', 'Stock', 'Status')
+        records = [(product.get('name', ''), product.get('sku', ''), product.get('stock', 0), 'Out of stock' if not product.get('stock') else 'Low stock' if product.get('stock', 0) <= product.get('minimum_stock', 5) else 'In stock') for product in data.get('products', [])]
+    elif report == 'customers':
+        headings = ('Customer', 'Email', 'Orders', 'Spending')
+        records = [(customer.get('name', ''), customer.get('email', ''), len([order for order in orders if order.get('customer_id') == customer.get('id')]), money(sum(order.get('total', 0) for order in orders if order.get('customer_id') == customer.get('id')))) for customer in data.get('customers', [])]
+    else:
+        headings = ('Product', 'SKU', 'Category', 'Price', 'Stock')
+        records = [(product.get('name', ''), product.get('sku', ''), product.get('category', ''), money(product.get('price', 0)), product.get('stock', 0)) for product in data.get('products', [])]
+    tabs = ''.join(f'<a class="pill {"active" if item == report else ""}" href="/admin/reports?type={item}">{item.title()}</a>' for item in report_types)
+    header = ''.join(f'<span>{esc(heading)}</span>' for heading in headings)
+    rows = ''.join('<div class="table-row">' + ''.join(f'<span>{esc(value)}</span>' for value in record) + '</div>' for record in records) or '<p class="empty">No data is available for this report yet.</p>'
+    metric_cards = ''.join(f'<div><span>{esc(label)}</span><b>{esc(value)}</b></div>' for label, value in metrics)
+    return layout(data, f'''<main class="admin-page"><section class="admin-content reports-page"><p class="eyebrow">ADMIN PANEL / REPORTS</p><h1>Business <em>reports.</em></h1><p class="hero-text">Review sales, users, payments, orders, customers, products, and inventory from one place.</p><div class="stats report-stats">{metric_cards}</div><div class="pills report-tabs">{tabs}</div><section class="panel"><div class="section-head"><div><p class="eyebrow">CURRENT REPORT</p><h2>{report.title()}</h2></div><a class="primary" href="/admin/reports.csv?type={report}">Download CSV ↗</a></div><div class="table"><div class="table-row table-head">{header}</div>{rows}</div></section><p class="note">Pending payments: {pending_payments}. Exported CSV files contain the full rows for the selected report.</p></section></main>''')
 
 def wishlist_page(data, session):
     ids = data.get('wishlists', {}).get(str(session.get('customer_id', session.get('token', 'guest'))), [])
@@ -980,6 +1090,7 @@ class Store(BaseHTTPRequestHandler):
         data['_auth_link'] = '<a href="/logout" aria-label="Sign out" title="Sign out">↪<span>Sign out</span></a>' if authenticated else ''
         data['_is_admin'] = bool(session.get('admin'))
         data['_admin_role'] = session.get('role')
+        data['_admin_email'] = session.get('email', '')
         if parsed.path == '/styles.css':
             self.send_response(200); self.send_header('Content-Type','text/css'); self.end_headers(); self.wfile.write((ROOT/'styles.css').read_bytes()); return
         if parsed.path == '/robots.txt':
@@ -1032,8 +1143,8 @@ class Store(BaseHTTPRequestHandler):
             else:
                 backup = json.dumps(read_db(), ensure_ascii=False, indent=2).encode(); self.send_response(200); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Disposition', 'attachment; filename=luxe-backup.json'); self.end_headers(); self.wfile.write(backup); return
         elif parsed.path == '/admin/reports' and session.get('admin'):
-            report = params.get('type', ['orders'])[0]
-            body = layout(data, f'<main class="admin-page"><section class="admin-content"><p class="eyebrow">ADMIN PANEL / REPORTS</p><h1>Business <em>reports.</em></h1><p class="hero-text">Export operational data for reconciliation and planning.</p><a class="primary" href="/admin/reports.csv?type={esc(report)}">Download CSV ↗</a></section></main>')
+            report = params.get('type', ['sales'])[0]
+            body = report_dashboard(data, report)
         elif parsed.path == '/admin/reports.csv' and session.get('admin'):
             csv = report_csv(data, params.get('type', ['orders'])[0]); self.send_response(200); self.send_header('Content-Type', 'text/csv'); self.send_header('Content-Disposition', 'attachment; filename=report.csv'); self.end_headers(); self.wfile.write(csv.encode()); return
         elif parsed.path == '/login': body = login_page(data, message)
@@ -1081,7 +1192,7 @@ class Store(BaseHTTPRequestHandler):
         token = self.csrf_token(session)
         body = body.replace('method="post"', f'method="post"><input type="hidden" name="csrf" value="{token}"') if 'method="post"' in body else body
         secure = '; Secure' if self.secure_cookie() else ''
-        self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.send_header('Set-Cookie', f'luxe_session={self.session_token}; HttpOnly; SameSite=Lax; Max-Age={SESSION_MAX_SECONDS}; Path=/{secure}'); self.send_header('X-Content-Type-Options', 'nosniff'); self.send_header('X-Frame-Options', 'DENY'); self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin'); self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains' if os.environ.get('APP_ENV') == 'production' else 'max-age=0'); self.send_header('Content-Security-Policy', "default-src 'self' https://images.unsplash.com https://wa.me https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; form-action 'self' https://wa.me; frame-ancestors 'none'"); self.end_headers(); self.wfile.write(body.encode())
+        self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.send_header('Set-Cookie', f'luxe_session={self.session_token}; HttpOnly; SameSite=Lax; Max-Age={SESSION_MAX_SECONDS}; Path=/{secure}'); self.send_header('X-Content-Type-Options', 'nosniff'); self.send_header('X-Frame-Options', 'DENY'); self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin'); self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains' if os.environ.get('APP_ENV') == 'production' else 'max-age=0'); self.send_header('Content-Security-Policy', "default-src 'self' https://images.unsplash.com https://wa.me https://fonts.googleapis.com https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; form-action 'self' https://wa.me; frame-ancestors 'none'"); self.end_headers(); self.wfile.write(body.encode())
     def do_POST(self):
         if self.rate_limited(): return self.send_error(429, 'Please slow down and try again.')
         length = int(self.headers.get('Content-Length', 0))
@@ -1102,7 +1213,7 @@ class Store(BaseHTTPRequestHandler):
         csrf_valid = hmac.compare_digest(form.get('csrf', [''])[0], self.csrf_token(session))
         if not csrf_valid and action not in ('login', 'register'):
             return self.send_error(403, 'Your form session expired. Please refresh and try again.')
-        if action in ('settings', 'branding', 'stock', 'order_status', 'payment_status', 'delivery_status', 'coupon', 'coupon_toggle', 'coupon_delete', 'customer_toggle', 'staff_create', 'staff_toggle', 'review_moderate', 'product_create', 'product_update', 'product_delete', 'categories_save', 'feature', 'restore') and not session.get('admin'): return self.send_error(403, 'Admin sign-in required.')
+        if action in ('settings', 'branding', 'stock', 'order_status', 'payment_status', 'delivery_status', 'coupon', 'coupon_toggle', 'coupon_delete', 'customer_toggle', 'staff_create', 'staff_toggle', 'review_moderate', 'product_create', 'product_update', 'product_delete', 'categories_save', 'feature', 'restore', 'clear_database') and not session.get('admin'): return self.send_error(403, 'Admin sign-in required.')
         if action == 'settings': data['shop']['name'] = form.get('shop_name',[data['shop']['name']])[0].strip() or data['shop']['name']; message = 'Shop information saved'
         if action == 'branding':
             for key in ('name','tagline','description','phone','whatsapp','email','location','business_hours','currency','country','delivery_fee','free_delivery_threshold','order_prefix','backup_schedule','backup_time','backup_day','backup_retention','logo','favicon','delivery_information','return_policy','privacy_policy','terms','story_heading','story_description','newsletter_heading','newsletter_description'):
@@ -1148,11 +1259,22 @@ class Store(BaseHTTPRequestHandler):
                 data['category_hierarchy'] = updated_categories; message = 'Category hierarchy saved'; destination = '/admin/categories'
         if action == 'restore':
             try:
-                restored = json.loads(form.get('backup_file', [''])[0])
-                if not isinstance(restored, dict) or not isinstance(restored.get('products'), list) or not isinstance(restored.get('shop'), dict): raise ValueError
+                restored = validate_backup(form.get('backup_file', [''])[0])
                 data = restored; audit(data, session, 'restore', 'Database backup restored'); message = 'Database restored'; destination = '/admin'
-            except (ValueError, TypeError, json.JSONDecodeError):
+            except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
                 message = 'Invalid backup file'; destination = '/admin/restore'
+        if action == 'clear_database':
+            if not is_superadmin_role(session.get('role')):
+                message = 'Only a superadmin can clear operational data'
+            elif form.get('clear_confirmation', [''])[0] != 'CLEAR DATABASE':
+                message = 'Type CLEAR DATABASE to confirm'
+            else:
+                preserved = {key: data[key] for key in ('shop', 'category_hierarchy', 'categories', 'users', 'integrations') if key in data}
+                data = preserved
+                for key in ('customers', 'orders', 'products', 'wishlists', 'reviews', 'coupons', 'audit_logs', 'inventory_movements', 'newsletter_subscribers', 'password_reset_otps'):
+                    data[key] = [] if key not in ('wishlists', 'password_reset_otps') else {}
+                audit(data, session, 'database_cleared', 'Operational database data cleared by superadmin')
+                message = 'Operational database data cleared'; destination = '/admin'
         if action == 'stock':
             product = next((p for p in data['products'] if str(p['id']) == form.get('product_id',[''])[0]), None)
             if product:
@@ -1341,7 +1463,7 @@ class Store(BaseHTTPRequestHandler):
         if action == 'staff_toggle' and session.get('admin'):
             staff_id = int(form.get('staff_id', [0])[0])
             user = next((item for item in data.get('users', []) if item.get('id') == staff_id), None)
-            if user and user.get('id') != session.get('customer_id'):
+            if is_superadmin_role(session.get('role')) and user and user.get('id') != session.get('customer_id'):
                 user['active'] = not user.get('active', True); audit(data, session, 'staff_toggle', f'{user.get("email", "Staff")} status updated'); message = 'Staff status updated'
             destination = '/admin/staff'
         if action == 'review_moderate' and session.get('admin'):
@@ -1371,7 +1493,7 @@ class Store(BaseHTTPRequestHandler):
                     if len(parts) == 3 and parts[0]: variants.append({'id': index, 'name': parts[0], 'price': float(parts[1]), 'stock': max(0, int(float(parts[2]))), 'active': True})
                 if 'variants' in form: product['variants'] = variants
                 message = 'Product updated'; destination = '/admin'
-        if action == 'product_delete' and session.get('admin'):
+        if action == 'product_delete' and is_superadmin_role(session.get('role')):
             product = next((p for p in data['products'] if str(p['id']) == form.get('product_id', [''])[0]), None)
             if product:
                 data['products'].remove(product); audit(data, session, 'product_delete', f'{product["name"]} deleted'); message = 'Product deleted'; destination = '/admin'

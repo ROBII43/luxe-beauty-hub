@@ -79,7 +79,7 @@ def update_product(product_id: int, payload: ProductUpdate, db: Session = Depend
 
 
 @router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_product(product_id: int, db: Session = Depends(get_db), claims: dict = Depends(require_permission("products:write"))) -> None:
+def delete_product(product_id: int, db: Session = Depends(get_db), claims: dict = Depends(require_permission("products:delete"))) -> None:
     product = db.get(Product, product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")

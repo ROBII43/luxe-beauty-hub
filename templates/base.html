@@ -49,6 +49,72 @@
     .settings-section select{display:block;width:100%;margin-top:7px;padding:10px;border:1px solid var(--line);border-radius:4px;background:var(--paper);color:var(--ink)}
     @media(max-width:560px){.settings-section{grid-template-columns:1fr;padding:18px}.settings-section label:has(textarea){grid-column:auto}}
   </style>
+  <style>
+    *,*::before,*::after{box-sizing:border-box}
+    html,body{max-width:100%;overflow-x:hidden}
+    img,video,svg{max-width:100%;height:auto}
+    main,section,.panel,.summary,.auth-card,.auth-visual{min-width:0}
+    .header{width:100%}
+    .hero-copy,.detail-copy,.checkout>section,.checkout>.summary{min-width:0}
+    .search{max-width:100%}
+    .newsletter form{max-width:100%}
+    @media (max-width:1100px){
+      .header nav{gap:14px!important;margin-right:12px}
+      .header .tools{gap:6px!important}
+      .hero-copy{padding-left:clamp(28px,6vw,72px)!important;padding-right:clamp(28px,6vw,72px)!important}
+      .product-page,.checkout{gap:clamp(24px,4vw,48px)}
+    }
+    @media (max-width:850px){
+      .header{padding-left:16px!important;padding-right:16px!important}
+      .header .logo{min-width:0;max-width:42vw}
+      .header .logo span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .header .tools{margin-left:auto}
+      .hero-copy{padding-top:52px!important;padding-bottom:52px!important}
+      .section-head{gap:16px}
+      .newsletter{margin-left:18px;margin-right:18px}
+      .newsletter form{width:100%;min-width:0!important}
+    }
+    @media (max-width:560px){
+      .header{height:68px!important}
+      .header .logo{max-width:44vw}
+      .header .logo span{font-size:9px!important;letter-spacing:.08em!important}
+      .header .tools a[data-theme]{display:none!important}
+      .header .tools a{min-width:30px!important;width:30px!important;height:30px!important;padding:0!important}
+      .header nav.mobile-open{top:68px!important}
+      .hero-copy{min-height:390px!important;padding:42px 20px!important}
+      .hero h1{font-size:clamp(38px,12vw,52px)!important}
+      .hero-image{min-height:330px!important}
+      .categories,.catalog,.info-page{padding-left:20px!important;padding-right:20px!important}
+      .section-head{display:block!important}
+      .section-head .under{display:inline-block;margin-top:14px}
+      .search{display:flex!important;flex-direction:column!important;width:100%!important;margin-top:16px}
+      .search input,.search select,.search button{width:100%!important;min-width:0!important;height:42px!important}
+      .pills{overflow-x:auto;padding-bottom:6px;flex-wrap:nowrap!important}
+      .pill{flex:0 0 auto}
+      .product-grid{grid-template-columns:1fr!important}
+      .product-image{aspect-ratio:4/5!important}
+      .price{display:flex!important;align-items:center;flex-wrap:wrap;gap:8px}
+      .price form{margin-left:auto!important;margin-top:0!important}
+      .newsletter{padding:34px 22px!important}
+      .newsletter form{display:flex!important;flex-direction:column!important}
+      .newsletter form input,.newsletter form button{width:100%!important}
+      footer{grid-template-columns:1fr!important;padding:42px 20px!important}
+      footer .footer-brand,footer div:last-child{grid-column:auto!important}
+      .contact-list{grid-template-columns:1fr!important}
+      .account-nav{overflow-x:auto;white-space:nowrap;padding-bottom:12px}
+      .account-grid{grid-template-columns:1fr!important}
+      .checkout-form,.branding-form{max-width:none!important}
+      .detail-actions{width:100%}
+      .detail-actions button{min-height:46px}
+      .admin-content{padding-left:16px!important;padding-right:16px!important}
+      .stats{grid-template-columns:1fr 1fr!important}
+    }
+    @media (max-width:380px){
+      .header .logo{max-width:38vw}
+      .header .tools a:nth-child(2){display:none!important}
+      .stats{grid-template-columns:1fr!important}
+    }
+  </style>
   <script>
     document.addEventListener('DOMContentLoaded', function () {
       const body = document.body;

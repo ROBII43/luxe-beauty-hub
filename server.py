@@ -604,11 +604,12 @@ def layout(data, body, theme=None):
     shop = data['shop']
     admin_role = data.get('_admin_role')
     admin_label = 'Superadmin' if admin_role in ('SUPER_ADMIN', 'SUPERADMIN') else 'Admin' if admin_role == 'ADMIN' else ''
+    assistant_link = '<a class="assistant-nav-link" href="/assistant">✦ Ask here</a>' if data.get('_customer_id') else ''
     rendered = render_template('base.html', {
         'description': esc(shop.get('description', 'Curated beauty, home and lifestyle essentials')),
         'title': esc(shop['name']),
         'theme': esc(theme),
-        'header': render_template('header.html', {'shop_name': esc(shop['name']), 'logo_html': logo_mark(shop, 'small'), 'wishlist_badge': f'<sup>{data.get("_wishlist_count", 0)}</sup>' if data.get('_wishlist_count', 0) else '', 'cart_badge': f'<sup>{data.get("_cart_count", 0)}</sup>' if data.get('_cart_count', 0) else '', 'account_link': data.get('_account_link', '/login'), 'wishlist_link': data.get('_wishlist_link', '/login'), 'cart_link': data.get('_cart_link', '/login'), 'auth_link': data.get('_auth_link', ''), 'admin_link': f'<a class="admin-nav-link" href="/admin">{admin_label}</a>' if admin_label else ''}),
+        'header': render_template('header.html', {'shop_name': esc(shop['name']), 'logo_html': logo_mark(shop, 'small'), 'wishlist_badge': f'<sup>{data.get("_wishlist_count", 0)}</sup>' if data.get('_wishlist_count', 0) else '', 'cart_badge': f'<sup>{data.get("_cart_count", 0)}</sup>' if data.get('_cart_count', 0) else '', 'account_link': data.get('_account_link', '/login'), 'wishlist_link': data.get('_wishlist_link', '/login'), 'cart_link': data.get('_cart_link', '/login'), 'auth_link': data.get('_auth_link', ''), 'assistant_link': assistant_link, 'admin_link': f'<a class="admin-nav-link" href="/admin">{admin_label}</a>' if admin_label else ''}),
         'content': body,
         'footer': render_template('footer.html', {'shop_name': esc(shop['name']), 'logo_html': logo_mark(shop, 'small'), 'tagline': esc(shop.get('tagline', '')), 'phone': esc(shop.get('phone', '')), 'whatsapp': esc(shop.get('whatsapp', '')), 'email': esc(shop.get('email', '')), 'location': esc(shop.get('location', '')), 'delivery_information': esc(shop.get('delivery_information', '')), 'return_policy': esc(shop.get('return_policy', '')), 'refund_policy': esc(shop.get('return_policy', '')), 'privacy_policy': esc(shop.get('privacy_policy', '')), 'terms': esc(shop.get('terms', '')), 'instagram': esc(shop.get('social', {}).get('instagram', '')), 'facebook': esc(shop.get('social', {}).get('facebook', '')), 'tiktok': esc(shop.get('social', {}).get('tiktok', ''))}),
     })
@@ -1066,6 +1067,14 @@ def admin_integrations(data):
 
 def assistant_answer(data, question):
     question = question.casefold()
+    if 'revenue' in question or 'sales' in question:
+        total = sum(float(order.get('total', 0) or 0) for order in data.get('orders', []) if order.get('status') != 'Cancelled')
+        return f'Recorded revenue is {money(total)} across {len(data.get("orders", []))} orders.'
+    if 'profit' in question or 'margin' in question:
+        revenue = sum(float(order.get('total', 0) or 0) for order in data.get('orders', []) if order.get('status') != 'Cancelled')
+        costs = sum(float(product.get('cost_price', 0) or 0) * int(item.get('quantity', 0)) for order in data.get('orders', []) for item in order.get('items', []) for product in data.get('products', []) if product.get('id') == item.get('product_id'))
+        expenses = sum(float(item.get('amount', 0) or 0) for item in data.get('expenses', []))
+        return f'Estimated profit is {money(revenue - costs - expenses)} after recorded product costs and expenses.'
     orders = data.get('orders', [])
     if 'revenue yesterday' in question:
         day = (datetime.now() - timedelta(days=1)).date().isoformat()
@@ -1085,8 +1094,47 @@ def assistant_answer(data, question):
         return ', '.join(customer.get('name', '') for customer in data.get('customers', []) if customer.get('id') not in active_ids) or 'No inactive customers found.'
     return 'I can answer revenue, best-selling products, low-stock risk, inactive customers, and promotion suggestions from the current store data.'
 
+def customer_assistant_answer(data, session, question):
+    question = question.casefold()
+    if any(term in question for term in ('revenue', 'profit', 'sales report', 'admin', 'staff', 'customer list', 'stock valuation')):
+        return 'I can help with products, your orders, payments, delivery, returns, and store policies. That question is available only to store administrators.'
+    if 'delivery' in question or 'shipping' in question:
+        return data.get('shop', {}).get('delivery_information', 'Delivery information is confirmed during checkout.')
+    if 'return' in question or 'refund' in question:
+        return data.get('shop', {}).get('return_policy', 'Please contact customer care with your order number for return assistance.')
+    if 'order' in question or 'tracking' in question:
+        orders = [order for order in data.get('orders', []) if order.get('customer_id') == session.get('customer_id')]
+        if not orders:
+            return 'You do not have any orders yet. You can browse the shop and place an order when ready.'
+        latest = max(orders, key=lambda order: str(order.get('created_at', '')))
+        return f'Your latest order {latest.get("order_number", "")} is {latest.get("status", "Pending")}. Payment: {latest.get("payment_status", "Pending")}. Total: {money(latest.get("total", 0))}.'
+    matches = [product for product in data.get('products', []) if any(term in f'{product.get("name", "")} {product.get("brand", "")} {product.get("category", "")} {product.get("tags", [])}'.casefold() for term in question.split() if len(term) > 2)]
+    if matches:
+        return 'Here are matching products: ' + ', '.join(f'{product.get("name", "Product")} ({money(product.get("price", 0))})' for product in matches[:5])
+    if any(term in question for term in ('product', 'perfume', 'serum', 'skin', 'makeup', 'hair')):
+        return 'Tell me a product name, brand, category, or concern and I will help you find a match.'
+    return 'I can help with products, your orders, payments, delivery, returns, refunds, and store policies. Please ask a customer-care question.'
+
+def assistant_report_type(question):
+    question = question.casefold()
+    if 'payment' in question: return 'payments'
+    if 'inventory' in question or 'stock' in question: return 'inventory'
+    if 'customer' in question: return 'customers'
+    if 'product' in question or 'best-selling' in question: return 'products'
+    if 'financial' in question or 'profit' in question or 'revenue' in question: return 'financial'
+    if 'order' in question or 'sales' in question: return 'orders'
+    return None
+
 def admin_assistant(data, answer=''):
-    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / ASSISTANT</p><h1>Business <em>assistant.</em></h1><p class="hero-text">Ask questions about current orders, revenue, products, stock, and customers. Answers are calculated from local store data.</p><section class="panel"><form method="get" class="checkout-form"><label>Your question<input name="q" placeholder="What were my best-selling perfumes this month?" value="{esc(answer[0] if isinstance(answer, tuple) else '')}"></label><button class="primary">Ask assistant</button></form>{f'<p class="notice">{esc(answer[1])}</p>' if isinstance(answer, tuple) else ''}</section></section></main>''')
+    question = answer[0] if isinstance(answer, tuple) else ''
+    response = answer[1] if isinstance(answer, tuple) else ''
+    report = assistant_report_type(question) if question else None
+    report_links = f'<p class="note">Download generated report: <a class="under" href="/admin/reports.csv?type={report}">CSV</a> <a class="under" href="/admin/reports.xlsx?type={report}">Excel</a> <a class="under" href="/admin/reports.pdf?type={report}">PDF</a> <a class="under" href="/admin/reports.print?type={report}">Print</a></p>' if report and response else ''
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / ASSISTANT</p><h1>Business <em>assistant.</em></h1><p class="hero-text">Ask operational questions and download a report generated from the current store data.</p><section class="panel"><form method="get" class="checkout-form"><label>Your question<input name="q" placeholder="What were my best-selling perfumes this month?" value="{esc(question)}"></label><button class="primary">Ask assistant</button></form>{f'<p class="notice">{esc(response)}</p>{report_links}' if response else ''}</section></section></main>''')
+
+def customer_assistant(data, session, question=''):
+    response = customer_assistant_answer(data, session, question) if question else ''
+    return layout(data, f'''<main class="info-page"><section class="info-hero"><p class="eyebrow">CUSTOMER CARE</p><h1>Ask <em>Luxe.</em></h1><p class="hero-text">Ask about products, your orders, payments, delivery, returns, and store policies.</p><form method="get" class="checkout-form"><label>Your question<input name="q" value="{esc(question)}" placeholder="Where is my latest order?"></label><button class="primary">Ask here</button></form>{f'<p class="notice">{esc(response)}</p>' if response else ''}</section></main>''')
 
 def admin_staff(data, message=''):
     rows = ''.join(f'<div class="table-row"><span>{esc(user.get("name", ""))}<small>{esc(user.get("email", ""))}</small></span><span>{esc(user.get("role", "STAFF"))}</span><span>{"Active" if user.get("active", True) else "Disabled"}</span><span><form method="post"><input type="hidden" name="action" value="staff_toggle"><input type="hidden" name="staff_id" value="{user.get("id", 0)}"><button>{"Disable" if user.get("active", True) else "Activate"}</button></form></span></div>' for user in data.get('users', []))
@@ -1150,6 +1198,17 @@ def category_manager(data, message=''):
     groups = ''.join(f'<fieldset><legend>{esc(category)}</legend><textarea name="category_{index}" rows="{max(4, len(subcategories))}" aria-label="{esc(category)} subcategories">{esc("\n".join(subcategories))}</textarea><small class="note">One subcategory per line.</small></fieldset>' for index, (category, subcategories) in enumerate(category_groups(data).items()))
     names = ''.join(f'<input type="hidden" name="name_{index}" value="{esc(category)}">' for index, category in enumerate(category_groups(data)))
     return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / CATALOGUE / CATEGORIES</p><h1>Product <em>categories.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<p class="hero-text">Manage the approved category hierarchy used by product entry and storefront filters.</p><form method="post" class="branding-form category-manager"><input type="hidden" name="action" value="categories_save">{names}{groups}<button class="primary">Save category hierarchy ✓</button></form></section></main>''')
+
+def admin_products(data, message='', query=''):
+    normalized_query = str(query or '').strip().casefold()
+    products = [product for product in data.get('products', []) if not normalized_query or normalized_query in f'{product.get("name", "")} {product.get("brand", "")} {product.get("sku", "")} {product.get("category", "")}'.casefold()]
+    rows = ''.join(f'<div class="table-row"><span><b>{esc(product.get("name", ""))}</b><small>{esc(product.get("brand", ""))} · {esc(product.get("sku", ""))}</small></span><span>{esc(product.get("category", ""))}</span><span>{money(product.get("price", 0))}</span><span>{product.get("stock", 0)}</span><span>{esc(product.get("status", "Active"))}</span><span><a class="under" href="/admin/products/edit?id={product.get("id")}">Edit</a>{f'<form method="post" class="inline-form"><input type="hidden" name="action" value="product_delete"><input type="hidden" name="product_id" value="{product.get("id")}"><button>Delete</button></form>' if is_superadmin_role(data.get('_admin_role')) else ''}</span></div>' for product in products) or '<p class="empty">No products yet. Add your first product below.</p>'
+    search = f'<form class="dashboard-filter" method="get"><label>Search products<input name="q" value="{esc(query)}" placeholder="Name, SKU, brand or category"></label><button class="primary">Search</button></form>'
+    fields = [('name', 'Product name'), ('sku', 'SKU'), ('brand', 'Brand'), ('barcode', 'Barcode'), ('price', 'Selling price'), ('discount_price', 'Sale/original price'), ('cost_price', 'Cost price'), ('stock', 'Stock'), ('minimum_stock', 'Low-stock threshold')]
+    controls = ''.join(f'<label>{label}<input name="{key}" type="number" step="0.01" {"required" if key in ("price", "stock") else ""}></label>' if key in ('price', 'discount_price', 'cost_price', 'stock', 'minimum_stock') else f'<label>{label}<input name="{key}" {"required" if key in ("name", "sku") else ""}></label>' for key, label in fields)
+    shipping_options = ''.join(f'<option>{shipping_class}</option>' for shipping_class in SHIPPING_CLASSES)
+    controls += f'<label>Category<select name="category" required><option value="">Select category</option>{category_options(data)}</select></label><label>Subcategory<select name="subcategory" required><option value="">Select subcategory</option>{subcategory_options(data)}</select></label><label>Shipping class<select name="shipping_class">{shipping_options}</select></label><label>Status<select name="status"><option>Active</option><option>Draft</option><option>Archived</option></select></label><label>Weight (kg)<input name="weight_kg" type="number" min="0" step="0.1" value="0.5"></label><label>Dimensions<input name="dimensions" placeholder="Length x width x height"></label><label>Product video URL<input name="video_url"></label><label>Product images<input name="image_file" type="file" accept=".jpg,.jpeg,.png,.webp" multiple required></label><label>Variants<small class="note">One per line: Name | Price | Stock</small><textarea name="variants"></textarea></label>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PRODUCTS</p><h1>Product <em>catalogue.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}{search}<section class="panel"><div class="section-head"><div><h2>All products</h2><p class="note">{len(products)} products in the catalogue</p></div><a class="primary" href="#add-product">Add product</a></div><div class="table"><div class="table-row table-head"><span>Product</span><span>Category</span><span>Price</span><span>Stock</span><span>Status</span><span>Actions</span></div>{rows}</div></section><section class="panel" id="add-product"><h2>Add new product</h2><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="product_create">{controls}<label>Description<textarea name="description"></textarea></label><label>Short description<textarea name="short_description"></textarea></label><label>Tags<input name="tags" placeholder="gift, new, featured"></label><button class="primary">Save product</button></form></section></section></main>''')
 
 def report_csv(data, report):
     output = io.StringIO(newline='')
@@ -1445,6 +1504,7 @@ class Store(BaseHTTPRequestHandler):
         data['_is_admin'] = bool(session.get('admin'))
         data['_admin_role'] = session.get('role')
         data['_admin_email'] = session.get('email', '')
+        data['_customer_id'] = session.get('customer_id') if session.get('customer_id') and not session.get('admin') else None
         if parsed.path == '/styles.css':
             self.send_response(200); self.send_header('Content-Type','text/css'); self.end_headers(); self.wfile.write((ROOT/'styles.css').read_bytes()); return
         if parsed.path == '/robots.txt':
@@ -1503,7 +1563,7 @@ class Store(BaseHTTPRequestHandler):
         elif parsed.path == '/admin/reviews': body = reviews_manager(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/engagement': body = admin_engagement(data) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/customers': body = admin_customers(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
-        elif parsed.path == '/admin/products': body = admin_products(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/products': body = admin_products(data, message, params.get('q', [''])[0]) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/inventory': body = admin_inventory(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/products/edit':
             product = next((p for p in data['products'] if str(p['id']) == params.get('id', [''])[0]), None)
@@ -1558,6 +1618,7 @@ class Store(BaseHTTPRequestHandler):
             document = receipt_pdf(data, order, document_label)
             self.send_response(200); self.send_header('Content-Type', 'application/pdf'); self.send_header('Content-Disposition', f'attachment; filename={document_label.lower()}-{order_number}.pdf'); self.send_header('Content-Length', str(len(document))); self.send_header('Cache-Control', 'no-store'); self.end_headers(); self.wfile.write(document); return
         elif parsed.path == '/order-confirmation': body = order_confirmation_page(data, params.get('order', [''])[0], session.pop('whatsapp_order_url', '')) if params.get('order', [''])[0] else info_page(data, 'ORDER CONFIRMATION', 'Thank you for your order.', 'Your order has been received.', '<a class="primary" href="/account/orders">View my orders ↗</a>')
+        elif parsed.path == '/assistant': body = customer_assistant(data, session, params.get('q', [''])[0]) if session.get('customer_id') and not session.get('admin') else login_page(data, 'Please sign in to use customer care.')
         elif parsed.path == '/search':
             query_text = params.get('q', [''])[0].strip().lower()
             result_count = sum(1 for product in data.get('products', []) if query_text and query_text in f'{product.get("name", "")} {product.get("brand", "")} {product.get("category", "")} {product.get("subcategory", "")} {product.get("sku", "")} {product.get("description", "")} {" ".join(product.get("tags", []))}'.lower())

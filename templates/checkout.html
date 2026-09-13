@@ -21,6 +21,19 @@
      const mpesaPhoneField = document.getElementById('mpesa-phone-field');
      const mpesaPhone = document.getElementById('mpesa-phone');
      const checkoutPhone = document.getElementById('checkout-phone');
+     const locationField = document.getElementById('checkout-location');
+     const deliveryLine = document.getElementById('checkout-delivery');
+     const totalLine = document.getElementById('checkout-total');
+     const updateDeliveryQuote = async () => {
+       if (!locationField.value.trim()) return;
+       const response = await fetch('/api/delivery-quote?location=' + encodeURIComponent(locationField.value));
+       if (!response.ok) return;
+       const quote = await response.json();
+       deliveryLine.querySelector('b').textContent = quote.fee === 0 ? 'FREE' : 'KSh ' + quote.fee.toLocaleString();
+       totalLine.querySelector('b').textContent = 'KSh ' + quote.total.toLocaleString();
+     };
+     locationField.addEventListener('change', updateDeliveryQuote);
+     locationField.addEventListener('blur', updateDeliveryQuote);
      const updateMpesaField = () => {
        const isMpesa = paymentSelect.value === 'M-Pesa';
        mpesaPhoneField.hidden = !isMpesa;
@@ -37,6 +50,9 @@
     <p class="eyebrow">ORDER SUMMARY</p>
     <h2>Delivery details</h2>
     <div class="checkout-items">{{items}}</div>
+    <div class="checkout-row"><span>Subtotal</span><b>{{subtotal}}</b></div>
+    <div class="checkout-row" id="checkout-delivery"><span>Delivery</span><b>{{delivery}}</b></div>
+    <div class="checkout-row total" id="checkout-total"><span>Total</span><b>{{total}}</b></div>
     <p class="hero-text">Your order will be confirmed immediately and stock will be reserved for delivery.</p>
   </aside>
 </main>

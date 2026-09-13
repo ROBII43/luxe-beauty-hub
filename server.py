@@ -5,13 +5,14 @@ import json
 import csv
 from http.cookies import SimpleCookie
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import base64
 import os
 import hmac
 import time
 import io
+import shutil
 import httpx
 import socket
 import threading
@@ -26,6 +27,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import Image as ReportLabImage, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from openpyxl import Workbook
+from delivery import SHIPPING_CLASSES, calculate_delivery, delivery_settings, product_shipping_class
 
 try:
     from PIL import Image
@@ -41,7 +44,15 @@ MAX_REQUEST_BYTES = 5 * 1024 * 1024
 SESSION_IDLE_SECONDS = 2 * 60 * 60
 SESSION_MAX_SECONDS = 8 * 60 * 60
 DISPLAY_CURRENCY = 'KSh'
-ADMIN_ROLES = {'ADMIN', 'SUPER_ADMIN', 'SUPERADMIN'}
+ADMIN_ROLES = {'ADMIN', 'SUPER_ADMIN', 'SUPERADMIN', 'STORE_MANAGER', 'SALES_STAFF', 'INVENTORY_STAFF', 'MARKETING', 'FINANCE', 'DELIVERY_STAFF'}
+ROLE_PERMISSIONS = {
+    'STORE_MANAGER': {'products', 'orders', 'inventory', 'customers', 'reports'},
+    'SALES_STAFF': {'orders', 'customers'},
+    'INVENTORY_STAFF': {'products', 'inventory'},
+    'MARKETING': {'promotions', 'content'},
+    'FINANCE': {'payments', 'expenses', 'reports', 'refunds'},
+    'DELIVERY_STAFF': {'deliveries'},
+}
 LAST_SCHEDULED_BACKUP = ''
 MAX_CONCURRENT_REQUESTS = max(16, int(os.environ.get('MAX_CONCURRENT_REQUESTS', '128')))
 
@@ -78,6 +89,9 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 def read_db():
     global DISPLAY_CURRENCY
     data = database.read_state(DATA)
+    for role, permissions in data.get('shop', {}).get('custom_roles', {}).items():
+        if role not in {'SUPER_ADMIN', 'SUPERADMIN'}:
+            ROLE_PERMISSIONS[role] = set(permissions)
     DISPLAY_CURRENCY = data.get('shop', {}).get('currency', 'KSh') or 'KSh'
     if not data.get('category_hierarchy'):
         category_file = ROOT / 'categories.json'
@@ -107,17 +121,35 @@ def write_db(data):
     data.pop('_theme', None)
     database.write_state(data)
 
-def audit(data, session, action, description):
-    data.setdefault('audit_logs', []).append({'user': session.get('customer_name', 'Admin'), 'action': action, 'description': description, 'ip_address': '', 'date': datetime.now().isoformat(timespec='seconds')})
+def audit(data, session, action, description, entity='', entity_id='', old_value=None, new_value=None):
+    data.setdefault('audit_logs', []).append({'user': session.get('customer_name', 'Admin'), 'action': action, 'description': description, 'entity': entity, 'entity_id': str(entity_id) if entity_id != '' else '', 'old_value': json.dumps(old_value, ensure_ascii=False, default=str) if old_value is not None else '', 'new_value': json.dumps(new_value, ensure_ascii=False, default=str) if new_value is not None else '', 'ip_address': session.get('_ip', ''), 'date': datetime.now().isoformat(timespec='seconds')})
+
+def notify_event(data, event_type, title, message, entity='', entity_id=''):
+    channels = data.setdefault('shop', {}).setdefault('notification_channels', ['dashboard', 'email'])
+    data.setdefault('notifications', []).append({'id': secrets.token_hex(6), 'type': event_type, 'title': title, 'message': message, 'entity': entity, 'entity_id': str(entity_id), 'channels': channels[:], 'read': False, 'created_at': datetime.now().isoformat(timespec='seconds')})
 
 def backup_path():
     directory = ROOT / 'backups'; directory.mkdir(exist_ok=True)
-    return directory / f'luxe-backup-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json'
+    return directory / f'luxe_beauty_backup_{datetime.now().strftime("%Y-%m-%d_%H%M%S")}.sql'
 
 def create_backup(data):
     target = backup_path()
-    target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    state = {key: value for key, value in data.items() if not key.startswith('_')}
+    payload = json.dumps(state, ensure_ascii=False, separators=(',', ':'))
+    encoded = base64.b64encode(payload.encode('utf-8')).decode('ascii')
+    escaped = payload.replace('\\', '\\\\').replace("'", "''")
+    sql = f"-- Luxe Beauty Hub backup generated {datetime.now().isoformat(timespec='seconds')}\n-- LUXE_STATE_JSON:{encoded}\nCREATE TABLE IF NOT EXISTS app_state (state_key VARCHAR(40) PRIMARY KEY, state_json JSON NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP);\nINSERT INTO app_state (state_key, state_json) VALUES ('store', CAST('{escaped}' AS JSON)) ON DUPLICATE KEY UPDATE state_json = VALUES(state_json);\n"
+    target.write_text(sql, encoding='utf-8')
     return target
+
+def backup_history():
+    files = list((ROOT / 'backups').glob('luxe_beauty_backup_*.sql')) + list((ROOT / 'backups').glob('luxe-backup-*.json'))
+    return sorted(({'name': file.name, 'size': file.stat().st_size, 'created_at': datetime.fromtimestamp(file.stat().st_mtime).isoformat(timespec='seconds')} for file in files if file.is_file()), key=lambda item: item['created_at'], reverse=True)
+
+def database_health(data):
+    history = backup_history()
+    latest = history[0] if history else None
+    return {'status': 'healthy' if isinstance(data, dict) and isinstance(data.get('shop'), dict) else 'degraded', 'products': len(data.get('products', [])), 'orders': len(data.get('orders', [])), 'customers': len(data.get('customers', [])), 'latest_backup': latest}
 
 def backup_task_command():
     python_bin = Path(sys.executable).resolve()
@@ -208,6 +240,17 @@ def shop_number(data, key, default):
     except (TypeError, ValueError):
         return float(default)
 
+def cart_delivery_items(data, cart):
+    items = []
+    for item in cart:
+        product = next((product for product in data.get('products', []) if product.get('id') == item.get('id')), None)
+        if product:
+            items.append({'shipping_class': product_shipping_class(product), 'weight_kg': product.get('weight_kg', 0.5), 'quantity': item.get('quantity', 0)})
+    return items
+
+def delivery_quote(data, location, subtotal, cart):
+    return calculate_delivery(delivery_settings(data.setdefault('shop', {})), location, subtotal, cart_delivery_items(data, cart))
+
 def add_pending_cart(data, session):
     pending = session.pop('pending_cart', None)
     if not pending:
@@ -224,7 +267,7 @@ def add_pending_cart(data, session):
         session['cart'].append({'id': product['id'], 'variant_id': pending.get('variant_id'), 'quantity': pending['quantity']})
     return True
 
-ORDER_STATUSES = ('Pending', 'Confirmed', 'Processing', 'Ready for Delivery', 'Shipped', 'Delivered', 'Cancelled', 'Returned')
+ORDER_STATUSES = ('Pending', 'Confirmed', 'Processing', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Returned', 'Refunded')
 
 def hash_password(password):
     salt = secrets.token_bytes(16)
@@ -289,6 +332,28 @@ def send_smtp_email(data, recipients, subject, body):
             smtp.login(user, password)
         smtp.send_message(message)
 
+def email_document(data, order, document_label='Invoice'):
+    recipient = order.get('email', '').strip()
+    if not recipient:
+        raise RuntimeError('Customer email is not available')
+    integrations = data.get('integrations', {})
+    host = integrations.get('smtp_host') or os.environ.get('SMTP_HOST', '')
+    port = int(integrations.get('smtp_port') or os.environ.get('SMTP_PORT', '587'))
+    user = integrations.get('smtp_user') or os.environ.get('SMTP_USER', '')
+    password = integrations.get('smtp_password') or os.environ.get('SMTP_PASSWORD', '')
+    sender = integrations.get('smtp_from') or os.environ.get('SMTP_FROM', user)
+    if not host or not sender:
+        raise RuntimeError('SMTP email is not configured')
+    message = EmailMessage()
+    message['Subject'] = f'{document_label} {order.get("order_number", "")} - {data.get("shop", {}).get("name", "Luxe Beauty Hub")}'
+    message['From'] = sender; message['To'] = recipient
+    message.set_content(f'Your {document_label.lower()} for order {order.get("order_number", "")} is attached.')
+    message.add_attachment(receipt_pdf(data, order, document_label), maintype='application', subtype='pdf', filename=f'{document_label.lower()}-{order.get("order_number", "")}.pdf')
+    with smtplib.SMTP(host, port, timeout=15) as smtp:
+        smtp.starttls()
+        if user and password: smtp.login(user, password)
+        smtp.send_message(message)
+
 def send_password_otp(data, email, code):
     send_smtp_email(data, [email], f'{data.get("shop", {}).get("name", "Luxe Beauty Hub")} password reset code', f'Your password reset code is {code}. It expires in 10 minutes. If you did not request this, ignore this email.')
 
@@ -345,10 +410,17 @@ def reset_password_page(data, email, message=''):
     return layout(data, body)
 
 def is_admin_role(role):
-    return role in ADMIN_ROLES
+    return role in ADMIN_ROLES or role in ROLE_PERMISSIONS
 
 def is_superadmin_role(role):
     return role in {'SUPER_ADMIN', 'SUPERADMIN'}
+
+def role_can(data, session, permission):
+    role = session.get('role', '')
+    return is_superadmin_role(role) or role == 'ADMIN' or permission in ROLE_PERMISSIONS.get(role, set())
+
+def action_permission(action):
+    return {'branding': 'content', 'settings': 'content', 'search_settings': 'content', 'delivery_settings': 'deliveries', 'delivery_zone_save': 'deliveries', 'delivery_zone_toggle': 'deliveries', 'delivery_zone_delete': 'deliveries', 'backup_now': 'content', 'restore': 'content', 'clear_database': 'content', 'role_save': 'content', 'role_delete': 'content', 'notification_settings': 'content', 'email_invoice': 'orders', 'expense_create': 'expenses', 'expense_delete': 'expenses', 'inventory_adjust': 'inventory', 'stock': 'inventory', 'order_status': 'orders', 'payment_status': 'payments', 'delivery_status': 'deliveries', 'return_request': 'refunds', 'return_status': 'refunds', 'refund_create': 'refunds', 'coupon': 'promotions', 'campaign_create': 'promotions', 'coupon_toggle': 'promotions', 'coupon_delete': 'promotions', 'customer_toggle': 'customers', 'staff_create': 'content', 'staff_toggle': 'content', 'review_moderate': 'content', 'product_create': 'products', 'product_update': 'products', 'product_delete': 'products', 'categories_save': 'products', 'feature': 'content'}.get(action)
 def online_account_emails():
     now = time.time()
     return {
@@ -361,6 +433,10 @@ def validate_backup(value):
     if isinstance(value, bytes):
         value = value.decode('utf-8-sig')
     if isinstance(value, str):
+        marker = '-- LUXE_STATE_JSON:'
+        if marker in value:
+            encoded = value.split(marker, 1)[1].splitlines()[0].strip()
+            value = base64.b64decode(encoded).decode('utf-8')
         value = json.loads(value.lstrip('\ufeff'))
     if not isinstance(value, dict) or not isinstance(value.get('products'), list) or not isinstance(value.get('shop'), dict):
         raise ValueError('Backup must contain products and shop data')
@@ -609,6 +685,64 @@ def admin(data, message=''):
     body = f'''<main class="admin-page"><div class="admin-shell">{sidebar}<section class="admin-content"><div class="section-head"><div><p class="eyebrow">BUSINESS OVERVIEW</p><h1>Good morning, <em>Admin.</em></h1></div><a class="under" href="/">View storefront ↗</a></div>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<div class="stats"><div><span>Total sales</span><b>{money(total_sales)}</b><small>All recorded orders</small></div><div><span>Today's sales</span><b>{money(today_sales)}</b><small>{today}</small></div><div><span>Pending orders</span><b>{pending}</b><small>{completed} delivered</small></div><div><span>Customers</span><b>{len(data.get('customers', []))}</b><small>{len(data.get('products', []))} products</small></div><div><span>Low stock</span><b>{low_stock}</b><small>{out_of_stock} out of stock</small></div></div><div class="admin-grid"><section class="panel sales-chart"><div class="section-head"><div><p class="eyebrow">SALES PERFORMANCE</p><h2>Recent sales</h2></div><a class="under" href="/admin/reports">View reports ↗</a></div><div class="chart-bars">{chart}</div></section><section class="panel"><p class="eyebrow">QUICK ACTIONS</p><h2>Keep things moving.</h2><div class="quick-actions"><a class="primary" href="/admin/products">Add product ↗</a><a class="under" href="/admin/orders">Review orders</a><a class="under" href="/admin/settings">Edit storefront</a></div></section></div><section class="panel"><div class="section-head"><div><p class="eyebrow">INVENTORY</p><h2>Product health</h2></div><a class="primary" href="/admin/products">Manage products ↗</a></div><div class="table"><div class="table-row table-head"><span>Product</span><span>Category</span><span>Price</span><span>Stock</span><span>Status</span><span></span></div>{rows}</div></section></section></div></main>'''
     return layout(data, body)
 
+def operations_dashboard(data, message='', params=None):
+    params = params or {}
+    now = datetime.now()
+    period = params.get('period', ['today'])[0]
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = now
+    if period == 'yesterday':
+        start -= timedelta(days=1); end = start + timedelta(days=1)
+    elif period == '7days': start -= timedelta(days=6)
+    elif period == '30days': start -= timedelta(days=29)
+    elif period == 'month': start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif period == 'year': start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif period == 'custom':
+        try: start = datetime.strptime(params.get('start', [''])[0], '%Y-%m-%d'); end = datetime.strptime(params.get('end', [''])[0], '%Y-%m-%d') + timedelta(days=1)
+        except ValueError: period = 'today'
+
+    def created_at(record):
+        try: return datetime.fromisoformat(str(record.get('created_at', '')).replace('Z', '+00:00')).replace(tzinfo=None)
+        except ValueError: return datetime.min
+
+    orders = [order for order in data.get('orders', []) if start <= created_at(order) < end]
+    all_orders = data.get('orders', [])
+    order_total = lambda order: float(order.get('total', 0) or 0)
+    revenue = sum(order_total(order) for order in orders if order.get('status') != 'Cancelled')
+    today = now.date()
+    def revenue_since(days=None, month=False, year=False):
+        if year: threshold = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        elif month: threshold = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        else: threshold = now - timedelta(days=days)
+        return sum(order_total(order) for order in all_orders if created_at(order) >= threshold and order.get('status') != 'Cancelled')
+
+    pending = sum(order.get('status', 'Pending') in ('Pending', 'Confirmed', 'Processing') for order in orders)
+    awaiting_delivery = sum(order.get('status') in ('Packed', 'Ready for Delivery', 'Shipped', 'Out for Delivery') for order in orders)
+    completed = sum(order.get('status') == 'Delivered' for order in orders)
+    cancelled = sum(order.get('status') in ('Cancelled', 'Returned') for order in orders)
+    refunds = sum(order_total(order) for order in orders if order.get('payment_status') == 'Refunded' or order.get('status') == 'Refunded')
+    mpesa = sum(order_total(order) for order in orders if order.get('payment_method') == 'M-Pesa')
+    failed_payments = sum(order.get('payment_status') == 'Failed' for order in orders)
+    low_stock = [product for product in data.get('products', []) if 0 < product.get('stock', 0) <= product.get('minimum_stock', 5)]
+    out_of_stock = [product for product in data.get('products', []) if product.get('stock', 0) == 0]
+    best_sellers = {}
+    for order in orders:
+        for item in order.get('items', []): best_sellers[item.get('product_id')] = best_sellers.get(item.get('product_id'), 0) + int(item.get('quantity', 0))
+    product_by_id = {product.get('id'): product for product in data.get('products', [])}
+    best_rows = ''.join(f'<div class="table-row"><span>{esc(product_by_id.get(product_id, {}).get("name", f"Product #{product_id}"))}</span><span>{quantity} sold</span></div>' for product_id, quantity in sorted(best_sellers.items(), key=lambda pair: pair[1], reverse=True)[:5]) or '<p class="empty">Sales will appear here after the first order.</p>'
+    recent_rows = ''.join(f'<div class="table-row"><span><b>{esc(order.get("order_number", ""))}</b><small>{esc(order.get("customer_name", "Guest"))}</small></span><span>{esc(order.get("status", "Pending"))}</span><span>{money(order_total(order))}</span></div>' for order in sorted(orders, key=created_at, reverse=True)[:8]) or '<p class="empty">No orders in this period.</p>'
+    activity_rows = ''.join(f'<div class="table-row"><span>{esc(log.get("date", ""))}</span><span>{esc(log.get("user", "Admin"))}</span><span>{esc(log.get("description", log.get("action", "")))}</span></div>' for log in sorted(data.get('audit_logs', []), key=lambda log: str(log.get('date', '')), reverse=True)[:8]) or '<p class="empty">No recent admin activity.</p>'
+    period_options = ''.join(f'<option value="{value}" {"selected" if value == period else ""}>{label}</option>' for value, label in (('today', 'Today'), ('yesterday', 'Yesterday'), ('7days', '7 Days'), ('30days', '30 Days'), ('month', 'This Month'), ('year', 'This Year'), ('custom', 'Custom')))
+    cards = [("Today's sales", money(revenue)), ('Orders', len(orders)), ('Pending orders', pending), ('Awaiting delivery', awaiting_delivery), ('Completed', completed), ('Cancelled', cancelled), ('Refunds', money(refunds)), ('Customers', len(data.get('customers', []))), ('Low stock', len(low_stock)), ('Out of stock', len(out_of_stock)), ('M-Pesa payments', money(mpesa)), ('Failed payments', failed_payments), ('Week revenue', money(revenue_since(7))), ('Month revenue', money(revenue_since(month=True))), ('Year revenue', money(revenue_since(year=True)))]
+    metric_cards = ''.join(f'<div><span>{label}</span><b>{value}</b></div>' for label, value in cards)
+    body = f'''<main class="admin-page"><div class="admin-shell"><aside class="sidebar"><div class="admin-logo">L　CONTROL<br>　 ROOM</div><p>WORKSPACE</p><a class="selected" href="/admin">▦ Dashboard</a><a href="/admin/products">□ Products <span>{len(data.get('products', []))}</span></a><a href="/admin/categories">▤ Categories</a><a href="/admin/orders">▱ Orders <span>{len(all_orders)}</span></a><a href="/admin/customers">♙ Customers</a><p>OPERATIONS</p><a href="/admin/payments">▣ Payments</a><a href="/admin/deliveries">▰ Deliveries</a><a href="/admin/promotions">◇ Promotions</a><a href="/admin/reports">◫ Reports</a><p>SETTINGS</p><a href="/admin/settings">⚙ Settings</a><a href="/admin/staff">♙ Users & roles</a><a href="/admin/audit">▤ Audit logs</a><a href="/admin/backup">⇩ Backup</a></aside><section class="admin-content"><div class="section-head"><div><p class="eyebrow">BUSINESS OVERVIEW</p><h1>Operations <em>dashboard.</em></h1></div><a class="under" href="/">View storefront ↗</a></div>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<form class="dashboard-filter"><label>Date range<select name="period">{period_options}</select></label><label>From<input name="start" type="date" value="{esc(params.get("start", [""])[0])}"></label><label>To<input name="end" type="date" value="{esc(params.get("end", [""])[0])}"></label><button class="primary">Apply filter</button></form><div class="stats">{metric_cards}</div><div class="admin-grid"><section class="panel"><div class="section-head"><div><p class="eyebrow">TOP PRODUCTS</p><h2>Best sellers</h2></div><a class="under" href="/admin/reports?type=products">View report ↗</a></div><div class="table">{best_rows}</div></section><section class="panel"><p class="eyebrow">PROFIT ESTIMATE</p><h2>{money(revenue)}</h2><p class="note">Estimated from recorded order totals. Add product cost prices and expenses for true net profit.</p><p class="note">Selected period: {esc(period.title())}</p></section></div><section class="panel"><div class="section-head"><div><p class="eyebrow">RECENT ORDERS</p><h2>Order activity</h2></div><a class="primary" href="/admin/orders">Manage orders ↗</a></div><div class="table"><div class="table-row table-head"><span>Order / customer</span><span>Status</span><span>Total</span></div>{recent_rows}</div></section><section class="panel"><div class="section-head"><div><p class="eyebrow">ADMIN ACTIVITY</p><h2>Recent changes</h2></div><a class="under" href="/admin/audit">Open audit log ↗</a></div><div class="table"><div class="table-row table-head"><span>Date</span><span>User</span><span>Activity</span></div>{activity_rows}</div></section></section></div></main>'''
+    body = body.replace('<a href="/admin/categories">▤ Categories</a>', '<a href="/admin/categories">▤ Categories</a><a href="/admin/inventory">▥ Inventory</a>')
+    body = body.replace('<a href="/admin/deliveries">▰ Deliveries</a>', '<a href="/admin/deliveries">▰ Deliveries</a><a href="/admin/returns">↩ Returns & refunds</a><a href="/admin/notifications">◉ Notifications</a>')
+    body = body.replace('<a href="/admin/promotions">◇ Promotions</a>', '<a href="/admin/promotions">◇ Promotions</a><a href="/admin/search">⌕ Search insights</a><a href="/admin/engagement">♡ Wishlist insights</a>')
+    body = body.replace('<a href="/admin/reports">◫ Reports</a>', '<a href="/admin/reports">◫ Reports</a><a href="/admin/expenses">▤ Expenses & profit</a>')
+    body = body.replace('<a href="/admin/audit">▤ Audit logs</a>', '<a href="/admin/audit">▤ Audit logs</a><a href="/admin/health">◉ System health</a><a href="/admin/security">⌁ Security center</a><a href="/admin/integrations">↗ Integrations</a><a href="/admin/assistant">✦ Business assistant</a>')
+    return layout(data, body)
+
 def product_page(data, product, session=None):
     images = product.get('images', [product['image']])
     gallery = ''.join(f'<img src="{esc(image)}" alt="{esc(product["name"])} thumbnail">' for image in images)
@@ -639,9 +773,7 @@ def cart_page(data, session):
         if product: items.append((product, item['quantity'], variant, item))
     subtotal = sum((variant or {}).get('price', product['price']) * quantity for product, quantity, variant, item in items)
     discount = sum((product.get('old_price', (variant or {}).get('price', product['price'])) - (variant or {}).get('price', product['price'])) * quantity for product, quantity, variant, item in items)
-    free_delivery_threshold = shop_number(data, 'free_delivery_threshold', 10000)
-    delivery_fee = shop_number(data, 'delivery_fee', 350)
-    delivery = 0 if not items or subtotal >= free_delivery_threshold else delivery_fee
+    delivery = float(delivery_quote(data, '', subtotal, session.get('cart', []))['fee']) if items else 0
     total = subtotal + delivery
     rows = ''.join(f'''<div class="checkout-row cart-line"><span>{esc(product['name'])}{f' · {esc(variant.get("name", ""))}' if variant else ''} × {quantity}</span><b>{money((variant or {}).get('price', product['price']) * quantity)}</b><form method="post"><input type="hidden" name="action" value="cart_update"><input type="hidden" name="product_id" value="{product['id']}"><input type="hidden" name="variant_id" value="{item.get('variant_id', '')}"><button name="change" value="-1">−</button><button name="change" value="1">＋</button></form><form method="post"><input type="hidden" name="action" value="cart_remove"><input type="hidden" name="product_id" value="{product['id']}"><button class="under">Remove</button></form></div>''' for product, quantity, variant, item in items)
     whatsapp_text = '; '.join(f'{p["name"]} x {quantity} - {money((variant or {}).get("price", p["price"]) * quantity)}' for p, quantity, variant, item in items)
@@ -652,11 +784,17 @@ def cart_page(data, session):
 
 def checkout_page(data, session, message='', whatsapp_order=False):
     items = []
+    subtotal = 0
     for item in session.get('cart', []):
         product = next((p for p in data['products'] if p['id'] == item['id']), None)
         variant = next((v for v in product.get('variants', []) if str(v.get('id')) == str(item.get('variant_id'))), None) if product and item.get('variant_id') else None
-        if product: items.append(f'<div class="checkout-row"><span>{esc(product["name"])} × {item["quantity"]}</span><b>{money((variant or {}).get("price", product["price"]) * item["quantity"])}</b></div>')
-    return layout(data, render_template('checkout.html', {'items': ''.join(items), 'message': f'<p class="notice">{esc(message)}</p>' if message else '', 'payment_method_m_pesa': '' if whatsapp_order else 'selected', 'payment_method_whatsapp': 'selected' if whatsapp_order else ''}))
+        if product:
+            line_total = (variant or {}).get('price', product['price']) * item['quantity']
+            subtotal += line_total
+            items.append(f'<div class="checkout-row"><span>{esc(product["name"])} × {item["quantity"]}</span><b>{money(line_total)}</b></div>')
+    quote = delivery_quote(data, '', subtotal, session.get('cart', []))
+    delivery_fee = float(quote['fee'])
+    return layout(data, render_template('checkout.html', {'items': ''.join(items), 'subtotal': money(subtotal), 'delivery': 'FREE' if delivery_fee == 0 else money(delivery_fee), 'total': money(subtotal + delivery_fee), 'message': f'<p class="notice">{esc(message)}</p>' if message else '', 'payment_method_m_pesa': '' if whatsapp_order else 'selected', 'payment_method_whatsapp': 'selected' if whatsapp_order else ''}))
 def cart_item_variant(data, item):
     product = next((p for p in data.get('products', []) if p['id'] == item.get('id')), None)
     return next((variant for variant in product.get('variants', []) if str(variant.get('id')) == str(item.get('variant_id'))), None) if product and item.get('variant_id') else None
@@ -665,6 +803,31 @@ def cart_item_price(data, item):
     product = next((p for p in data.get('products', []) if p['id'] == item.get('id')), None)
     variant = cart_item_variant(data, item)
     return (variant or {}).get('price', product.get('price', 0)) if product else 0
+
+def coupon_discount(data, coupon, subtotal, cart, customer_id=None):
+    if not coupon or not coupon.get('active', True):
+        return 0
+    expiry = str(coupon.get('expiry_date', '')).strip()
+    if expiry and expiry < datetime.now().strftime('%Y-%m-%d'):
+        return 0
+    if subtotal < float(coupon.get('minimum_order', 0) or 0):
+        return 0
+    if int(coupon.get('usage_limit', 0) or 0) and int(coupon.get('used', 0) or 0) >= int(coupon.get('usage_limit')):
+        return 0
+    if customer_id and int(coupon.get('per_customer_limit', 0) or 0):
+        used_by_customer = sum(1 for order in data.get('orders', []) if order.get('customer_id') == customer_id and order.get('coupon_code') == coupon.get('code'))
+        if used_by_customer >= int(coupon.get('per_customer_limit')):
+            return 0
+    product_ids = {int(value) for value in coupon.get('product_ids', []) if str(value).isdigit()}
+    categories = {str(value).casefold() for value in coupon.get('categories', [])}
+    if product_ids and not any(item.get('id') in product_ids for item in cart):
+        return 0
+    if categories and not any(str(next((product.get('category', '') for product in data.get('products', []) if product.get('id') == item.get('id')), '')).casefold() in categories for item in cart):
+        return 0
+    value = float(coupon.get('value', 0) or 0)
+    discount = subtotal * value / 100 if coupon.get('type', 'percentage') == 'percentage' else value
+    maximum = float(coupon.get('maximum_discount', 0) or 0)
+    return max(0, min(discount, maximum if maximum else discount, subtotal))
 
 def info_page(data, eyebrow, title, intro, body):
     return layout(data, render_template('info.html', {'eyebrow': esc(eyebrow), 'title': esc(title), 'intro': esc(intro), 'body': body}))
@@ -685,6 +848,22 @@ def search_page(data, query):
     page_results = f'<section class="search-pages"><p class="eyebrow">WEBSITE PAGES</p>{page_results}</section>' if page_results else ''
     return layout(data, render_template('search.html', {'query': esc(query.get('q', [''])[0]), 'count': len(products), 'results': ''.join(card(product) for product in products) or '<p class="empty">No matching products found.</p>', 'page_results': page_results}))
 
+def record_search(data, query, result_count):
+    query = str(query or '').strip().lower()[:120]
+    if not query:
+        return
+    record = data.setdefault('search_terms', {}).setdefault(query, {'count': 0, 'no_results': 0, 'last_searched': ''})
+    record['count'] += 1
+    if result_count == 0: record['no_results'] += 1
+    record['last_searched'] = datetime.now().isoformat(timespec='seconds')
+
+def admin_search(data, message=''):
+    terms = data.get('search_terms', {})
+    rows = ''.join(f'<div class="table-row"><span>{esc(term)}</span><span>{stats.get("count", 0)}</span><span>{stats.get("no_results", 0)}</span><span>{esc(stats.get("last_searched", ""))}</span></div>' for term, stats in sorted(terms.items(), key=lambda item: item[1].get('count', 0), reverse=True)[:50]) or '<p class="empty">Search activity will appear here.</p>'
+    tags = sorted({tag for product in data.get('products', []) for tag in product.get('tags', [])})
+    seo_keywords = ', '.join(data.get('shop', {}).get('seo_keywords', [])) if isinstance(data.get('shop', {}).get('seo_keywords', []), list) else data.get('shop', {}).get('seo_keywords', '')
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SEARCH</p><h1>Search <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><h2>Search keywords</h2><div class="table"><div class="table-row table-head"><span>Keyword</span><span>Searches</span><span>No results</span><span>Last searched</span></div>{rows}</div></section><section class="panel"><h2>SEO keywords & product tags</h2><form method="post" class="checkout-form"><input type="hidden" name="action" value="search_settings"><label>SEO keywords<textarea name="seo_keywords">{esc(seo_keywords)}</textarea></label><p class="note">Current product tags: {esc(', '.join(tags) or 'None')}</p><button class="primary">Save search settings</button></form></section></section></main>''')
+
 def categories_page(data):
     body = f'<main class="catalog category-directory"><p class="eyebrow">SHOP BY CATEGORY</p><h1>Find your <em>collection.</em></h1><p class="hero-text">Explore beauty, home, lifestyle, and everyday essentials.</p><div class="category-grid">{shop_categories(data)}</div></main>'
     return layout(data, body)
@@ -704,13 +883,13 @@ def receipt_page(data, order):
     item_rows = ''.join(f'<tr><td>{esc(item_name(item)[0])}<small>{esc(item_name(item)[1])}</small></td><td>{item.get("quantity", 1)}</td><td>{money(item.get("unit_price", 0) * item.get("quantity", 1))}</td></tr>' for item in order.get('items', []))
     return f'''<!doctype html><html><head><meta charset="utf-8"><title>Receipt {esc(order.get("order_number", ""))}</title><style>@page{{size:80mm auto;margin:0}}*{{box-sizing:border-box}}body{{width:80mm;margin:0;padding:7mm 5mm;font:11px/1.4 Arial,sans-serif;color:#1f2924;background:#fff}}.receipt{{width:100%}}.receipt-head{{text-align:center;border-bottom:1px dashed #777;padding-bottom:10px;margin-bottom:10px}}.receipt-logo{{max-width:42mm;max-height:16mm;object-fit:contain;margin-bottom:5px}}h1{{font-size:17px;margin:2px 0}}.muted{{color:#68736b;font-size:10px}}.meta{{border-bottom:1px dashed #777;padding-bottom:8px;margin-bottom:8px}}.meta p{{margin:2px 0}}table{{width:100%;border-collapse:collapse}}th{{text-align:left;font-size:9px;border-bottom:1px solid #333;padding:3px 0}}td{{padding:5px 0;vertical-align:top;border-bottom:1px dotted #bbb}}th:nth-child(2),td:nth-child(2){{text-align:center;width:12mm}}th:last-child,td:last-child{{text-align:right}}td small{{display:block;color:#68736b;font-size:9px}}.totals{{border-top:1px solid #333;margin-top:8px;padding-top:6px}}.total{{font-size:14px;font-weight:700}}.footer{{border-top:1px dashed #777;margin-top:12px;padding-top:8px;text-align:center;font-size:9px}}.print{{display:block;margin:12px auto;padding:8px 12px;background:#3f5548;color:#fff;border:0}}@media print{{.print{{display:none}}}}</style></head><body><main class="receipt"><header class="receipt-head">{logo}<h1>{esc(shop.get("name", "Luxe Beauty Hub"))}</h1><div class="muted">{esc(shop.get("tagline", ""))}</div><div class="muted">{esc(shop.get("phone", ""))} · {esc(shop.get("email", ""))}</div></header><section class="meta"><p><b>Receipt:</b> {esc(order.get("order_number", ""))}</p><p><b>Date:</b> {esc(order.get("created_at", ""))}</p><p><b>Status:</b> {esc(order.get("status", "Pending"))}</p><p><b>Payment:</b> {esc(order.get("payment_method", ""))} · {esc(order.get("payment_status", "Pending"))}</p>{f'<p><b>M-Pesa:</b> {esc(order.get("mpesa_phone", ""))}</p>' if order.get("mpesa_phone") else ''}</section><section class="meta"><p><b>Customer:</b> {esc(order.get("customer_name", "Guest"))}</p><p>{esc(order.get("email", ""))}</p><p>{esc(order.get("phone", ""))}</p><p>{esc(order.get("address", ""))}, {esc(order.get("location", ""))}</p></section><table><thead><tr><th>Item</th><th>Qty</th><th>Amount</th></tr></thead><tbody>{item_rows or '<tr><td colspan="3">Order details available in admin.</td></tr>'}</tbody></table><section class="totals"><p>Subtotal <span style="float:right">{money(order.get("subtotal", order.get("total", 0)))}</span></p><p>Delivery <span style="float:right">{money(order.get("delivery_fee", 0))}</span></p><p class="total">TOTAL <span style="float:right">{money(order.get("total", 0))}</span></p></section><footer class="footer">Thank you for shopping with us.<br>{esc(shop.get("location", ""))}</footer><button class="print" onclick="window.print()">Print receipt</button></main></body></html>'''
 
-def receipt_pdf(data, order):
+def receipt_pdf(data, order, document_label='Receipt'):
     output = io.BytesIO()
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle('ReceiptTitle', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=16, textColor=colors.HexColor('#1f2924'), alignment=1, spaceAfter=4)
     center_style = ParagraphStyle('ReceiptCenter', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#68736b'), alignment=1, leading=12)
     small_style = ParagraphStyle('ReceiptSmall', parent=styles['Normal'], fontSize=9, leading=12)
-    document = SimpleDocTemplate(output, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm, title=f'Receipt {order.get("order_number", "")}')
+    document = SimpleDocTemplate(output, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm, title=f'{document_label} {order.get("order_number", "")}')
     shop = data.get('shop', {})
     story = []
     logo_source = shop.get('logo', '').strip()
@@ -720,7 +899,7 @@ def receipt_pdf(data, order):
         logo_image.hAlign = 'CENTER'
         story.append(logo_image)
     story.extend([Paragraph(esc(shop.get('name', 'Luxe Beauty Hub')), title_style), Paragraph(esc(shop.get('tagline', '')), center_style), Paragraph(esc(f'{shop.get("phone", "")} · {shop.get("email", "")}'), center_style), Spacer(1, 8)])
-    metadata = [['Receipt', order.get('order_number', '')], ['Date', order.get('created_at', '')], ['Status', order.get('status', 'Pending')], ['Payment', f'{order.get("payment_method", "")} · {order.get("payment_status", "Pending")}'], ['Customer', order.get('customer_name', '')], ['Delivery', f'{order.get("address", "")}, {order.get("location", "")}']]
+    metadata = [[document_label, order.get('invoice_number' if document_label == 'Invoice' else 'receipt_number', order.get('order_number', ''))], ['Order', order.get('order_number', '')], ['Date', order.get('created_at', '')], ['Status', order.get('status', 'Pending')], ['Payment', f'{order.get("payment_method", "")} · {order.get("payment_status", "Pending")}'], ['Customer', order.get('customer_name', '')], ['Delivery', f'{order.get("address", "")}, {order.get("location", "")}']]
     story.append(Table([[Paragraph(esc(str(key)), small_style), Paragraph(esc(str(value)), small_style)] for key, value in metadata], colWidths=[28 * mm, 134 * mm], style=TableStyle([('GRID', (0, 0), (-1, -1), 0.25, colors.HexColor('#d6ddd7')), ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f1f4f0')), ('VALIGN', (0, 0), (-1, -1), 'TOP'), ('PADDING', (0, 0), (-1, -1), 6)])))
     story.append(Spacer(1, 12))
     rows = [[Paragraph('<b>Item</b>', small_style), Paragraph('<b>Qty</b>', small_style), Paragraph('<b>Amount</b>', small_style)]]
@@ -779,9 +958,34 @@ def promotions_page(data, message=''):
     coupons = ''.join(f'''<div class="checkout-row"><span><b>{esc(c["code"])}</b> · {c["type"]}<small class="muted-line">{c.get("used", 0)} / {c.get("usage_limit", "∞")} uses · {"Active" if c.get("active", True) else "Disabled"}</small></span><b>{c["value"]}% off</b><span><form method="post" class="inline-form"><input type="hidden" name="action" value="coupon_toggle"><input type="hidden" name="code" value="{esc(c["code"])}"><button>{"Disable" if c.get("active", True) else "Activate"}</button></form><form method="post" class="inline-form"><input type="hidden" name="action" value="coupon_delete"><input type="hidden" name="code" value="{esc(c["code"])}"><button onclick="return confirm('Delete this coupon?')">Delete</button></form></span></div>''' for c in data.get('coupons', []))
     return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / MARKETING</p><h1>Coupons & <em>promotions.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><h2>Active coupons</h2>{coupons or '<p class="empty">No coupons yet.</p>'}<form method="post" class="checkout-form"><input type="hidden" name="action" value="coupon"><label>Coupon code<input name="code" placeholder="SAVE20" required></label><label>Percentage discount<input name="value" type="number" min="1" max="100" required></label><label>Usage limit<input name="usage_limit" type="number" min="1" value="100" required></label><button class="primary">Create coupon ↗</button></form></section></section></main>''')
 
+def promotions_manager(data, message=''):
+    coupons = ''.join(f'<div class="table-row"><span><b>{esc(c.get("code", ""))}</b><small>{esc(c.get("type", "percentage"))} · {esc(c.get("expiry_date", "No expiry"))}</small></span><span>{money(c.get("value", 0)) if c.get("type") == "fixed" else f"{c.get("value", 0)}%"}</span><span>{c.get("used", 0)} / {c.get("usage_limit", "∞")}</span><span>{"Active" if c.get("active", True) else "Disabled"}</span><span><form method="post" class="inline-form"><input type="hidden" name="action" value="coupon_toggle"><input type="hidden" name="code" value="{esc(c.get("code", ""))}"><button>{"Disable" if c.get("active", True) else "Activate"}</button></form><form method="post" class="inline-form"><input type="hidden" name="action" value="coupon_delete"><input type="hidden" name="code" value="{esc(c.get("code", ""))}"><button>Delete</button></form></span></div>' for c in data.get('coupons', [])) or '<p class="empty">No coupons yet.</p>'
+    campaigns = ''.join(f'<div class="table-row"><span><b>{esc(campaign.get("name", ""))}</b><small>{esc(campaign.get("type", "Promotion"))}</small></span><span>{esc(campaign.get("starts_at", ""))} to {esc(campaign.get("ends_at", ""))}</span><span>{"Active" if campaign.get("active", True) else "Disabled"}</span></div>' for campaign in data.get('campaigns', [])) or '<p class="empty">No campaigns yet.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / MARKETING</p><h1>Coupons & <em>promotions.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><h2>Coupons</h2><div class="table"><div class="table-row table-head"><span>Code</span><span>Value</span><span>Usage</span><span>Status</span><span>Actions</span></div>{coupons}</div><h3>Create coupon</h3><form method="post" class="checkout-form"><input type="hidden" name="action" value="coupon"><label>Coupon code<input name="code" placeholder="LUXE20" required></label><label>Type<select name="coupon_type"><option value="percentage">Percentage</option><option value="fixed">Fixed amount</option></select></label><label>Value<input name="value" type="number" min="0.01" step="0.01" required></label><label>Minimum order (KSh)<input name="minimum_order" type="number" min="0" step="0.01" value="0"></label><label>Maximum discount (KSh)<input name="maximum_discount" type="number" min="0" step="0.01" value="0"></label><label>Expiry date<input name="expiry_date" type="date"></label><label>Usage limit<input name="usage_limit" type="number" min="0" value="100"></label><label>Per-customer limit<input name="per_customer_limit" type="number" min="0" value="0"></label><label>Categories<input name="coupon_categories" placeholder="Perfume, Skincare"></label><label>Product IDs<input name="coupon_products" placeholder="1, 2"></label><button class="primary">Create coupon</button></form></section><section class="panel"><h2>Campaigns</h2><div class="table"><div class="table-row table-head"><span>Campaign</span><span>Dates</span><span>Status</span></div>{campaigns}</div><form method="post" class="checkout-form"><input type="hidden" name="action" value="campaign_create"><label>Campaign name<input name="campaign_name" placeholder="Weekend sale" required></label><label>Type<select name="campaign_type"><option>Flash sale</option><option>Weekend sale</option><option>Black Friday</option><option>Valentine's promotion</option><option>Christmas promotion</option><option>Buy 1 Get 1</option><option>Bundle discount</option><option>Free delivery promotion</option></select></label><label>Starts<input name="campaign_starts" type="datetime-local" required></label><label>Ends<input name="campaign_ends" type="datetime-local" required></label><button class="primary">Create campaign</button></form></section></section></main>''')
+
 def admin_reviews(data, message=''):
     rows = ''.join(f'''<div class="review admin-review"><b>{esc(review.get('customer_name', 'Customer'))} · {'★' * int(review.get('rating', 5))}</b><p>{esc(review.get('text', ''))}</p><small>{esc(review.get('created_at', ''))}</small><form method="post"><input type="hidden" name="action" value="review_moderate"><input type="hidden" name="review_id" value="{review['id']}"><button name="decision" value="approve">Approve</button><button name="decision" value="hide">Hide</button><button name="decision" value="delete">Delete</button></form></div>''' for review in data.get('reviews', [])) or '<p class="empty">No reviews waiting for moderation.</p>'
     return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PRODUCTS / REVIEWS</p><h1>Review <em>moderation.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel">{rows}</section></section></main>''')
+
+def reviews_manager(data, message=''):
+    reviews = data.get('reviews', [])
+    approved = [review for review in reviews if review.get('approved') and not review.get('hidden')]
+    average = sum(float(review.get('rating', 0)) for review in approved) / len(approved) if approved else 0
+    product_counts = {}
+    for review in reviews: product_counts[review.get('product_id')] = product_counts.get(review.get('product_id'), 0) + 1
+    rows = ''.join(f'<div class="review admin-review"><b>{esc(review.get("customer_name", "Customer"))} · {"★" * int(review.get("rating", 5))}</b><p>{esc(review.get("text", ""))}</p><small>{esc(review.get("created_at", ""))} · {"Approved" if review.get("approved") and not review.get("hidden") else "Pending/hidden"}</small><form method="post"><input type="hidden" name="action" value="review_moderate"><input type="hidden" name="review_id" value="{review.get("id", 0)}"><button name="decision" value="approve">Approve</button><button name="decision" value="reject">Reject</button><button name="decision" value="hide">Hide</button><button name="decision" value="delete">Delete</button></form></div>' for review in reversed(reviews)) or '<p class="empty">No reviews yet.</p>'
+    stats = f'<div class="stats"><div><span>Total reviews</span><b>{len(reviews)}</b></div><div><span>Pending</span><b>{sum(1 for review in reviews if not review.get("approved") and not review.get("hidden"))}</b></div><div><span>Average rating</span><b>{average:.1f}</b></div><div><span>Most reviewed product</span><b>{max(product_counts.values(), default=0)}</b></div></div>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / REVIEWS</p><h1>Review <em>moderation.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}{stats}<section class="panel">{rows}</section></section></main>''')
+
+def admin_engagement(data):
+    product_counts = {}
+    customer_interest = {}
+    for customer_id, product_ids in data.get('wishlists', {}).items():
+        customer_interest[customer_id] = len(product_ids)
+        for product_id in product_ids: product_counts[product_id] = product_counts.get(product_id, 0) + 1
+    products = {product.get('id'): product for product in data.get('products', [])}
+    rows = ''.join(f'<div class="table-row"><span>{esc(products.get(product_id, {}).get("name", f"Product #{product_id}"))}</span><span>{count}</span><span>{money(products.get(product_id, {}).get("price", 0))}</span></div>' for product_id, count in sorted(product_counts.items(), key=lambda item: item[1], reverse=True)) or '<p class="empty">Wishlist activity will appear here.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / CUSTOMER ENGAGEMENT</p><h1>Wishlist <em>insights.</em></h1><section class="panel"><p class="hero-text">{len(product_counts)} products have been wishlisted by {len(customer_interest)} customers.</p><div class="table"><div class="table-row table-head"><span>Product</span><span>Wishlist additions</span><span>Price</span></div>{rows}</div></section></section></main>''')
 
 def admin_customers(data, message=''):
     rows = ''
@@ -793,6 +997,17 @@ def admin_customers(data, message=''):
     rows = rows or '<p class="empty">No customers yet.</p>'
     return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / CUSTOMERS</p><h1>Customer <em>directory.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Customer</span><span>Orders</span><span>Status</span><span>Action</span></div>{rows}</div></section></section></main>''')
 
+def admin_customers(data, message=''):
+    rows = ''
+    for customer in data.get('customers', []):
+        orders = [order for order in data.get('orders', []) if order.get('customer_id') == customer.get('id')]
+        spending = sum(float(order.get('total', 0) or 0) for order in orders)
+        last_order = max((str(order.get('created_at', '')) for order in orders), default='Never')
+        segment = 'VIP' if spending >= 50000 else 'Returning' if len(orders) > 1 else 'New'
+        rows += f'<div class="table-row"><span><b>{esc(customer.get("name", ""))}</b><small>{esc(customer.get("email", ""))} · {esc(customer.get("phone", ""))}</small></span><span>{len(orders)} orders</span><span>{money(spending)}</span><span>{esc(last_order)}</span><span>{segment} · {"Active" if customer.get("active", True) else "Disabled"}</span><span><form method="post"><input type="hidden" name="action" value="customer_toggle"><input type="hidden" name="customer_id" value="{customer.get("id")}"><button>{"Disable" if customer.get("active", True) else "Activate"}</button></form></span></div>'
+    rows = rows or '<p class="empty">No customers yet.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / CUSTOMERS</p><h1>Customer <em>directory.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Customer</span><span>Orders</span><span>Spending</span><span>Last order</span><span>Segment/status</span><span>Action</span></div>{rows}</div></section></section></main>''')
+
 def admin_payments(data, message=''):
     rows = ''.join(f'<div class="table-row"><span>{esc(order.get("order_number", ""))}<small>{esc(order.get("customer_name", "Guest"))} · {esc(order.get("email", ""))}</small><small>{esc(order.get("phone", ""))} · {esc(order.get("mpesa_phone", ""))}</small><a class="under" href="/receipt?order={esc(order.get("order_number", ""))}">Download receipt</a></span><span>{money(order.get("total", 0))}</span><span>{esc(order.get("payment_method", "Pending"))}</span><span><form method="post"><input type="hidden" name="action" value="payment_status"><input type="hidden" name="order_number" value="{esc(order["order_number"])}"><select name="payment_status"><option>Pending</option><option>Paid</option><option>Failed</option><option>Refunded</option></select><button>Save</button></form></span></div>' for order in reversed(data.get('orders', []))) or '<p class="empty">No payments yet.</p>'
     return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PAYMENTS</p><h1>Payment <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Order</span><span>Total</span><span>Method</span><span>Status</span></div>{rows}</div></section></section></main>''')
@@ -801,9 +1016,77 @@ def admin_deliveries(data, message=''):
     rows = ''.join(f'<div class="table-row"><span>{esc(order.get("order_number", ""))}<small>{esc(order.get("customer_name", "Guest"))} · {esc(order.get("location", ""))}</small></span><span>{esc(order.get("address", ""))}</span><span><form method="post"><input type="hidden" name="action" value="delivery_status"><input type="hidden" name="order_number" value="{esc(order["order_number"])}"><select name="delivery_status"><option>Pending</option><option>Ready for Delivery</option><option>Shipped</option><option>Delivered</option><option>Returned</option></select><button>Save</button></form></span></div>' for order in reversed(data.get('orders', []))) or '<p class="empty">No deliveries yet.</p>'
     return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / DELIVERIES</p><h1>Delivery <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="table"><div class="table-row table-head"><span>Order</span><span>Address</span><span>Status</span></div>{rows}</div></section></section></main>''')
 
+def admin_returns(data, message=''):
+    returns = ''.join(f'<div class="table-row"><span><b>{esc(item.get("id", ""))}</b><small>Order {esc(item.get("order_number", ""))} · {esc(item.get("customer_name", "Customer"))}</small></span><span>{esc(item.get("reason", ""))}<small>Product: {esc(item.get("product_name", "All items"))}</small></span><span>{esc(item.get("status", "Requested"))}</span><span><form method="post" class="inline-form"><input type="hidden" name="action" value="return_status"><input type="hidden" name="return_id" value="{esc(item.get("id", ""))}"><select name="return_status"><option>Requested</option><option>Approved</option><option>Rejected</option><option>Received</option><option>Refunded</option></select><button>Save</button></form></span></div>' for item in reversed(data.get('returns', []))) or '<p class="empty">No return requests yet.</p>'
+    refunds = ''.join(f'<div class="table-row"><span><b>{esc(item.get("reference", ""))}</b><small>Order {esc(item.get("order_number", ""))}</small></span><span>{money(item.get("amount", 0))}</span><span>{esc(item.get("method", ""))}</span><span>{esc(item.get("status", "Pending"))}<small>{esc(item.get("reason", ""))}</small></span></div>' for item in reversed(data.get('refunds', []))) or '<p class="empty">No refunds recorded.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / RETURNS & REFUNDS</p><h1>Returns <em>and refunds.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><h2>Return requests</h2><div class="table"><div class="table-row table-head"><span>Request</span><span>Reason / product</span><span>Status</span><span>Action</span></div>{returns}</div><h3>Create return request</h3><form method="post" class="checkout-form"><input type="hidden" name="action" value="return_request"><label>Order number<input name="order_number" required></label><label>Product ID (optional)<input name="product_id" type="number" min="1"></label><label>Reason<textarea name="return_reason" required></textarea></label><button class="primary">Create return request</button></form></section><section class="panel"><h2>Refunds</h2><div class="table"><div class="table-row table-head"><span>Reference</span><span>Amount</span><span>Method</span><span>Status</span></div>{refunds}</div><h3>Record refund</h3><form method="post" class="checkout-form"><input type="hidden" name="action" value="refund_create"><label>Order number<input name="order_number" required></label><label>Amount (KSh)<input name="refund_amount" type="number" min="0.01" step="0.01" required></label><label>Reason<textarea name="refund_reason" required></textarea></label><button class="primary">Record pending refund</button></form></section></section></main>''')
+
+def admin_notifications(data, message=''):
+    channels = data.get('shop', {}).get('notification_channels', ['dashboard', 'email'])
+    rows = ''.join(f'<div class="table-row"><span><b>{esc(item.get("title", "Notification"))}</b><small>{esc(item.get("created_at", ""))} · {esc(item.get("type", ""))}</small></span><span>{esc(item.get("message", ""))}</span><span>{"Read" if item.get("read") else "Unread"}</span></div>' for item in reversed(data.get('notifications', [])[-50:])) or '<p class="empty">No notifications yet.</p>'
+    options = ''.join(f'<label><input type="checkbox" name="notification_channel" value="{channel}" {"checked" if channel in channels else ""}> {channel.title()}</label>' for channel in ('dashboard', 'email', 'sms', 'whatsapp'))
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / NOTIFICATIONS</p><h1>Alerts & <em>notifications.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><h2>Notification channels</h2><form method="post" class="checkout-form"><input type="hidden" name="action" value="notification_settings">{options}<button class="primary">Save channels</button></form><p class="note">Events are stored on the dashboard. Email requires SMTP configuration; SMS and WhatsApp require a provider integration.</p></section><section class="panel"><h2>Recent alerts</h2><div class="table"><div class="table-row table-head"><span>Alert</span><span>Message</span><span>Status</span></div>{rows}</div></section></section></main>''')
+
+def admin_expenses(data, message=''):
+    expenses = data.get('expenses', [])
+    total = sum(float(item.get('amount', 0) or 0) for item in expenses)
+    rows = ''.join(f'<div class="table-row"><span>{esc(item.get("date", ""))}</span><span>{esc(item.get("category", "Other"))}</span><span>{esc(item.get("description", ""))}</span><span>{money(float(item.get("amount", 0)))}</span><span><form method="post" class="inline-form"><input type="hidden" name="action" value="expense_delete"><input type="hidden" name="expense_id" value="{esc(item.get("id", ""))}"><button>Delete</button></form></span></div>' for item in reversed(expenses)) or '<p class="empty">No expenses recorded.</p>'
+    categories = ('Stock purchases', 'Delivery', 'Advertising', 'Packaging', 'Salaries', 'Rent', 'Internet', 'Other')
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / FINANCE</p><h1>Expenses & <em>profit.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><h2>Recorded expenses</h2><p class="hero-text">Total expenses: {money(total)}</p><div class="table"><div class="table-row table-head"><span>Date</span><span>Category</span><span>Description</span><span>Amount</span><span></span></div>{rows}</div></section><section class="panel"><h2>Add expense</h2><form method="post" class="checkout-form"><input type="hidden" name="action" value="expense_create"><label>Date<input name="expense_date" type="date" value="{datetime.now():%Y-%m-%d}" required></label><label>Category<select name="expense_category">{"".join(f"<option>{category}</option>" for category in categories)}</select></label><label>Description<input name="expense_description" required></label><label>Amount (KSh)<input name="expense_amount" type="number" min="0.01" step="0.01" required></label><button class="primary">Record expense</button></form></section></section></main>''')
+
 def admin_audit_logs(data):
-    rows = ''.join(f'<div class="table-row"><span>{esc(log.get("date", ""))}</span><span>{esc(log.get("user", "Admin"))}</span><span>{esc(log.get("action", ""))}</span><span>{esc(log.get("description", ""))}</span></div>' for log in reversed(data.get('audit_logs', []))) or '<p class="empty">No audit events recorded.</p>'
-    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SECURITY</p><h1>Audit <em>logs.</em></h1><section class="panel"><div class="table"><div class="table-row table-head"><span>Date</span><span>User</span><span>Action</span><span>Description</span></div>{rows}</div></section></section></main>''')
+    rows = ''.join(f'<div class="table-row"><span>{esc(log.get("date", ""))}<small>{esc(log.get("ip_address", ""))}</small></span><span>{esc(log.get("user", "Admin"))}</span><span>{esc(log.get("action", ""))}<small>{esc(log.get("entity", ""))} {esc(log.get("entity_id", ""))}</small></span><span>{esc(log.get("description", ""))}<small>Old: {esc(log.get("old_value", ""))}</small><small>New: {esc(log.get("new_value", ""))}</small></span></div>' for log in reversed(data.get('audit_logs', []))) or '<p class="empty">No audit events recorded.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SECURITY</p><h1>Audit <em>logs.</em></h1><p class="hero-text">Every operational change records who acted, what changed, the affected record, source IP, and time.</p><section class="panel"><div class="table"><div class="table-row table-head"><span>Date / IP</span><span>User</span><span>Action / Record</span><span>Description / Values</span></div>{rows}</div></section></section></main>''')
+
+def system_health(data):
+    disk = shutil.disk_usage(ROOT)
+    latest = (database_health(data).get('latest_backup') or {}).get('name', 'Never')
+    smtp = data.get('integrations', {}).get('smtp_host') or os.environ.get('SMTP_HOST', '')
+    mpesa = data.get('integrations', {}).get('mpesa_consumer_key') or os.environ.get('MPESA_CONSUMER_KEY', '')
+    return {'Application': 'Healthy', 'Database': 'Connected' if data.get('shop') is not None else 'Unavailable', 'M-Pesa API': 'Configured' if mpesa else 'Not configured', 'Email / SMTP': 'Configured' if smtp else 'Not configured', 'Storage': f'{disk.free / (1024 ** 3):.1f} GB free of {disk.total / (1024 ** 3):.1f} GB', 'Database size': f'{len(json.dumps(data, default=str)) / 1024:.1f} KB state', 'Server': 'Running', 'Last backup': latest, 'Failed jobs': len(data.get('failed_jobs', [])), 'Error logs': len(data.get('error_logs', []))}
+
+def admin_health(data):
+    checks = system_health(data)
+    rows = ''.join(f'<div class="table-row"><span>{esc(key)}</span><span class="health-value">{esc(value)}</span></div>' for key, value in checks.items())
+    errors = ''.join(f'<div class="table-row"><span>{esc(item.get("created_at", ""))}</span><span>{esc(item.get("message", ""))}</span></div>' for item in reversed(data.get('error_logs', [])[-30:])) or '<p class="empty">No application errors recorded.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SYSTEM</p><h1>System <em>health.</em></h1><section class="panel health-grid">{rows}</section><section class="panel"><h2>Error logs</h2><div class="table"><div class="table-row table-head"><span>Time</span><span>Message</span></div>{errors}</div></section></section></main>''')
+
+def admin_security(data):
+    login_events = [log for log in data.get('audit_logs', []) if log.get('action') in ('admin_login', 'login', 'logout', 'password_changed')]
+    rows = ''.join(f'<div class="table-row"><span>{esc(log.get("date", ""))}</span><span>{esc(log.get("user", ""))}</span><span>{esc(log.get("action", ""))}</span><span>{esc(log.get("ip_address", ""))}</span></div>' for log in reversed(login_events[-50:])) or '<p class="empty">No login activity recorded.</p>'
+    active = sum(1 for item in SESSIONS.values() if time.time() - item.get('last_seen', 0) <= SESSION_IDLE_SECONDS)
+    failed = len([log for log in data.get('audit_logs', []) if log.get('action') == 'login_failed'])
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SECURITY</p><h1>Security <em>center.</em></h1><div class="stats"><div><span>Active sessions</span><b>{active}</b></div><div><span>Failed logins</span><b>{failed}</b></div><div><span>2FA / MFA</span><b>Available for API settings</b></div><div><span>Role enforcement</span><b>Enabled</b></div></div><section class="panel"><h2>Login and security history</h2><div class="table"><div class="table-row table-head"><span>Date</span><span>User</span><span>Action</span><span>IP</span></div>{rows}</div></section><section class="panel"><h2>Security controls</h2><p class="note">Admin settings MFA, secure production cookies, role permissions, encrypted API settings, CSRF protection, rate limiting, and audit logging are enabled.</p><a class="primary" href="/admin/audit">Open complete audit log</a></section></section></main>''')
+
+def admin_integrations(data):
+    integrations = data.setdefault('integrations', {})
+    services = [('M-Pesa', 'mpesa_environment', 'Payments and STK Push'), ('SMTP', 'smtp_host', 'Email and invoices'), ('WhatsApp', 'whatsapp', 'Customer messaging'), ('Google Analytics', 'google_analytics_id', 'Traffic analytics'), ('Meta Pixel', 'meta_pixel_id', 'Campaign attribution'), ('Google Search Console', 'search_console_verification', 'Search verification'), ('SMS provider', 'sms_provider', 'SMS notifications'), ('Delivery provider', 'delivery_provider', 'Courier integrations'), ('Cloud storage', 'cloud_storage', 'Media and backup storage')]
+    rows = ''.join(f'<div class="table-row"><span><b>{label}</b><small>{description}</small></span><span>{"Configured" if integrations.get(key) or data.get("shop", {}).get(key) else "Not configured"}</span></div>' for label, key, description in services)
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / INTEGRATIONS</p><h1>Connected <em>services.</em></h1><p class="hero-text">Configuration is stored in the existing protected integration settings. Provider secrets are never displayed here.</p><section class="panel"><div class="table"><div class="table-row table-head"><span>Service</span><span>Status</span></div>{rows}</div></section><a class="primary" href="/admin/settings">Configure integrations</a></section></main>''')
+
+def assistant_answer(data, question):
+    question = question.casefold()
+    orders = data.get('orders', [])
+    if 'revenue yesterday' in question:
+        day = (datetime.now() - timedelta(days=1)).date().isoformat()
+        return money(sum(float(order.get('total', 0) or 0) for order in orders if str(order.get('created_at', '')).startswith(day)))
+    if 'run out' in question:
+        products = [product.get('name', '') for product in data.get('products', []) if product.get('stock', 0) <= product.get('minimum_stock', 5)]
+        return ', '.join(products) or 'No products are currently below their stock thresholds.'
+    if 'best-selling' in question or 'best selling' in question:
+        counts = {}
+        for order in orders:
+            for item in order.get('items', []): counts[item.get('product_id')] = counts.get(item.get('product_id'), 0) + item.get('quantity', 0)
+        products = {product.get('id'): product.get('name', '') for product in data.get('products', [])}
+        return ', '.join(f'{products.get(product_id, "Product")} ({quantity})' for product_id, quantity in sorted(counts.items(), key=lambda item: item[1], reverse=True)[:5]) or 'There are no sales to analyze yet.'
+    if '90 days' in question or 'inactive' in question:
+        cutoff = datetime.now() - timedelta(days=90)
+        active_ids = {order.get('customer_id') for order in orders if str(order.get('created_at', '')) and datetime.fromisoformat(str(order['created_at'])[:19]) >= cutoff}
+        return ', '.join(customer.get('name', '') for customer in data.get('customers', []) if customer.get('id') not in active_ids) or 'No inactive customers found.'
+    return 'I can answer revenue, best-selling products, low-stock risk, inactive customers, and promotion suggestions from the current store data.'
+
+def admin_assistant(data, answer=''):
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / ASSISTANT</p><h1>Business <em>assistant.</em></h1><p class="hero-text">Ask questions about current orders, revenue, products, stock, and customers. Answers are calculated from local store data.</p><section class="panel"><form method="get" class="checkout-form"><label>Your question<input name="q" placeholder="What were my best-selling perfumes this month?" value="{esc(answer[0] if isinstance(answer, tuple) else '')}"></label><button class="primary">Ask assistant</button></form>{f'<p class="notice">{esc(answer[1])}</p>' if isinstance(answer, tuple) else ''}</section></section></main>''')
 
 def admin_staff(data, message=''):
     rows = ''.join(f'<div class="table-row"><span>{esc(user.get("name", ""))}<small>{esc(user.get("email", ""))}</small></span><span>{esc(user.get("role", "STAFF"))}</span><span>{"Active" if user.get("active", True) else "Disabled"}</span><span><form method="post"><input type="hidden" name="action" value="staff_toggle"><input type="hidden" name="staff_id" value="{user.get("id", 0)}"><button>{"Disable" if user.get("active", True) else "Activate"}</button></form></span></div>' for user in data.get('users', []))
@@ -817,29 +1100,51 @@ def admin_staff(data, message=''):
         ('SUPERADMINS', lambda account: is_superadmin_role(account.get('role'))),
         ('ADMINS', lambda account: account.get('role') == 'ADMIN'),
         ('USERS', lambda account: not is_admin_role(account.get('role'))),
-    )
+    ) + tuple((role, lambda account, role=role: account.get('role') == role) for role in sorted(data.get('shop', {}).get('custom_roles', {})))
     can_manage = is_superadmin_role(data.get('_admin_role'))
 
     def account_rows(accounts_for_group):
         return ''.join(f'<div class="table-row"><span><b>{esc(account.get("name", ""))}</b><small>{esc(account.get("email", ""))}</small></span><span>{esc(account.get("role", "CUSTOMER"))}</span><span><i class="status {"online" if account.get("email", "").strip().lower() in online_emails else "offline"}">{"Online" if account.get("email", "").strip().lower() in online_emails else "Offline"}</i></span><span>{"Active" if account.get("active", True) else "Disabled"}</span><span>{f'<form method="post" class="inline-form"><input type="hidden" name="action" value="staff_toggle"><input type="hidden" name="staff_id" value="{account.get("id", 0)}"><button>{"Disable" if account.get("active", True) else "Activate"}</button></form>' if can_manage and account in data.get("users", []) and account.get("email", "").strip().lower() != data.get("_admin_email", "").lower() else ""}</span></div>' for account in accounts_for_group) or '<p class="empty">No accounts in this group.</p>'
 
     sections = ''.join(f'<section class="panel staff-group"><div class="section-head"><div><p class="eyebrow">ACCOUNT GROUP</p><h2>{label.title()}</h2></div><span class="note">{sum(1 for account in accounts.values() if predicate(account))} accounts</span></div><div class="table"><div class="table-row table-head"><span>Name</span><span>Role</span><span>Presence</span><span>State</span><span>Action</span></div>{account_rows([account for account in accounts.values() if predicate(account)])}</div></section>' for label, predicate in groups)
-    create_form = f'<form method="post" class="checkout-form"><input type="hidden" name="action" value="staff_create"><label>Name<input name="staff_name" required></label><label>Email<input name="staff_email" type="email" required></label><label>Temporary password<input name="staff_password" type="password" required></label><label>Role<select name="staff_role"><option>STAFF</option><option>MANAGER</option><option>ADMIN</option></select></label><button class="primary">Create staff account</button></form>' if can_manage else '<p class="note">Only a superadmin can create or change managed accounts.</p>'
-    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / USERS & ROLES</p><h1>Account <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<p class="hero-text">Live presence is based on recent activity within the current session window.</p><div class="staff-groups">{sections}</div><section class="panel"><h2>Add staff account</h2>{create_form}</section></section></main>''')
+    role_options = ''.join(f'<option>{role}</option>' for role in sorted(set(ROLE_PERMISSIONS) | {'ADMIN'}))
+    create_form = f'<form method="post" class="checkout-form"><input type="hidden" name="action" value="staff_create"><label>Name<input name="staff_name" required></label><label>Email<input name="staff_email" type="email" required></label><label>Temporary password<input name="staff_password" type="password" required></label><label>Role<select name="staff_role">{role_options}</select></label><button class="primary">Create staff account</button></form>' if can_manage else '<p class="note">Only a superadmin can create or change managed accounts.</p>'
+    permissions = ('products', 'orders', 'inventory', 'customers', 'payments', 'deliveries', 'promotions', 'expenses', 'refunds', 'reports', 'content')
+    role_checkboxes = ''.join(f'<label><input type="checkbox" name="role_permission" value="{permission}"> {permission.title()}</label>' for permission in permissions)
+    role_form = f'<section class="panel"><h2>Create custom role</h2><p class="note">Choose which admin dashboards this role can open and operate.</p><form method="post" class="checkout-form"><input type="hidden" name="action" value="role_save"><label>Role name<input name="role_name" placeholder="Regional Manager" required></label><div class="role-permissions">{role_checkboxes}</div><button class="primary">Save role</button></form></section>' if can_manage else ''
+    custom_roles = ''.join(f'<div class="table-row"><span><b>{esc(role)}</b></span><span>{esc(", ".join(sorted(perms)))}</span><span><form method="post" class="inline-form"><input type="hidden" name="action" value="role_delete"><input type="hidden" name="role_name" value="{esc(role)}"><button>Delete role</button></form></span></div>' for role, perms in data.get('shop', {}).get('custom_roles', {}).items()) or '<p class="empty">No custom roles yet.</p>'
+    roles_panel = f'<section class="panel"><h2>Custom roles</h2><div class="table"><div class="table-row table-head"><span>Role</span><span>Dashboards</span><span>Action</span></div>{custom_roles}</div></section>' if can_manage else ''
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / USERS & ROLES</p><h1>Account <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<p class="hero-text">Live presence is based on the current role policy. Custom roles can be assigned to staff accounts without code changes.</p><div class="staff-groups">{sections}</div><section class="panel"><h2>Add staff account</h2>{create_form}</section>{role_form}{roles_panel}</section></main>''')
 
 def admin_restore(data, message=''):
     clear_control = '''<section class="panel danger-panel"><p class="eyebrow">SUPERADMIN ONLY</p><h2>Clear operational data</h2><p class="note">This removes products, orders, customers, payments, reviews, coupons, wishlists, and activity history. Shop settings, categories, and staff accounts are preserved.</p><form method="post" class="checkout-form" onsubmit="return confirm('This will permanently clear operational data. Continue?')"><input type="hidden" name="action" value="clear_database"><label>Type CLEAR DATABASE to confirm<input name="clear_confirmation" required autocomplete="off" pattern="CLEAR DATABASE"></label><button class="primary danger-button">CLEAR DATABASE</button></form></section>''' if is_superadmin_role(data.get('_admin_role')) else ''
-    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / DATABASE</p><h1>Backup & <em>restore.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="restore"><label>Backup JSON file<input name="backup_file" type="file" accept=".json,application/json" required></label><button class="primary" onclick="return confirm('Restore this database backup?')">RESTORE DATABASE</button></form><small class="note">Restoring replaces the current application state with the selected validated JSON backup.</small></section>{clear_control}</section></main>''')
+    health = database_health(data)
+    history = ''.join(f'<div class="table-row"><span>{esc(item["name"])}</span><span>{item["size"]:,} bytes</span><span>{esc(item["created_at"])}</span><span><a class="under" href="/admin/backup?download={quote(item["name"])}">Download</a></span></div>' for item in backup_history()[:12]) or '<p class="empty">No backups have been created yet.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / DATABASE</p><h1>Backup & <em>restore.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><div class="section-head"><div><h2>Database health</h2><p class="note">Status: <b>{esc(health["status"])}</b> · {health["products"]} products · {health["orders"]} orders · {health["customers"]} customers</p></div><form method="post"><input type="hidden" name="action" value="backup_now"><button class="primary">Create backup now</button></form></div><p class="note">Automatic backup: {esc(data.get("shop", {}).get("backup_schedule", "disabled"))} at {esc(data.get("shop", {}).get("backup_time", "02:00"))}. Latest: {esc((health["latest_backup"] or {}).get("name", "Never"))}</p></section><section class="panel"><h2>Backup history</h2><div class="table"><div class="table-row table-head"><span>File</span><span>Size</span><span>Created</span><span></span></div>{history}</div></section><section class="panel"><h2>Restore backup</h2><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="restore"><label>Backup SQL or JSON file<input name="backup_file" type="file" accept=".sql,.json,application/sql,application/json" required></label><button class="primary" onclick="return confirm('Restore this database backup?')">RESTORE DATABASE</button></form><small class="note">SQL backups are generated for the application state table and remain compatible with older JSON backups.</small></section>{clear_control}</section></main>''')
 
 def admin_products(data, message=''):
-    fields = [('name', 'Product name'), ('sku', 'SKU'), ('brand', 'Brand'), ('price', 'Selling price'), ('discount_price', 'Original price'), ('stock', 'Stock'), ('minimum_stock', 'Minimum stock')]
-    controls = ''.join(f'<label>{label}<input name="{key}" type="number" step="0.01" {"required" if key in ("price", "stock") else ""}></label>' if key in ('price', 'discount_price', 'stock', 'minimum_stock') else f'<label>{label}<input name="{key}" {"required" if key in ("name", "sku") else ""}></label>' for key, label in fields)
-    controls += f'<label>Category<select name="category" required><option value="">Select category</option>{category_options(data)}</select></label><label>Subcategory<select name="subcategory" required><option value="">Select subcategory</option>{subcategory_options(data)}</select></label>'
+    fields = [('name', 'Product name'), ('sku', 'SKU'), ('brand', 'Brand'), ('barcode', 'Barcode'), ('price', 'Selling price'), ('discount_price', 'Sale/original price'), ('cost_price', 'Cost price'), ('stock', 'Stock'), ('minimum_stock', 'Low-stock threshold')]
+    controls = ''.join(f'<label>{label}<input name="{key}" type="number" step="0.01" {"required" if key in ("price", "stock") else ""}></label>' if key in ('price', 'discount_price', 'cost_price', 'stock', 'minimum_stock') else f'<label>{label}<input name="{key}" {"required" if key in ("name", "sku") else ""}></label>' for key, label in fields)
+    shipping_options = ''.join(f'<option>{shipping_class}</option>' for shipping_class in SHIPPING_CLASSES)
+    controls += f'<label>Category<select name="category" required><option value="">Select category</option>{category_options(data)}</select></label><label>Subcategory<select name="subcategory" required><option value="">Select subcategory</option>{subcategory_options(data)}</select></label><label>Shipping class<select name="shipping_class">{shipping_options}</select></label><label>Status<select name="status"><option>Active</option><option>Draft</option><option>Archived</option></select></label><label>Weight (kg)<input name="weight_kg" type="number" min="0" step="0.1" value="0.5"></label><label>Dimensions<input name="dimensions" placeholder="Length x width x height"></label><label>Product video URL<input name="video_url"></label>'
     controls += '<label>Product images (JPG, JPEG, PNG, WEBP)<input id="image-file" name="image_file" type="file" accept=".jpg,.jpeg,.png,.webp" multiple required><small class="note">The first image is primary. Maximum 5 MB per image.</small></label><label>Variants<small class="note">One per line: Name | Price | Stock</small><textarea name="variants" placeholder="50ml | 12400 | 8"></textarea></label>'
     return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PRODUCTS</p><h1>Add a <em>product.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="product_create">{controls}<label>Description<textarea name="description"></textarea></label><label>Tags<input name="tags" placeholder="gift, new, featured"></label><button class="primary">SAVE PRODUCT ↗</button><a class="under" href="/admin">Cancel</a></form></section></section></main>''')
 
 def admin_product_edit(data, product, message=''):
     return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PRODUCTS / EDIT</p><h1>Edit <em>{esc(product['name'])}.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="product_update"><input type="hidden" name="product_id" value="{product['id']}"><label>Product name<input name="name" value="{esc(product['name'])}" required></label><label>SKU<input name="sku" value="{esc(product.get('sku', ''))}" required></label><label>Brand<input name="brand" value="{esc(product.get('brand', ''))}"></label><label>Selling price (KSh)<input name="price" type="number" step="0.01" value="{product['price']}" required></label><label>Original price (KSh)<input name="discount_price" type="number" step="0.01" value="{product.get('old_price') or ''}"></label><label>Stock<input name="stock" type="number" value="{product['stock']}" required></label><label>Minimum stock<input name="minimum_stock" type="number" value="{product.get('minimum_stock', 5)}"></label><label>Category<select name="category" required>{category_options(data, product.get('category', ''))}</select></label><label>Subcategory<select name="subcategory" required>{subcategory_options(data, product.get('subcategory', ''))}</select></label><label>Product image<input id="image-file" name="image_file" type="file" accept=".jpg,.jpeg,.png,.webp"><img id="image-preview" class="upload-preview" src="{esc(product.get('image', ''))}" alt="Product preview"></label><label>Description<textarea name="description">{esc(product.get('description', ''))}</textarea></label><label>Tags<input name="tags" value="{esc(', '.join(product.get('tags', [])))}"></label><button class="primary">SAVE PRODUCT CHANGES ✓</button><a class="under" href="/admin">Cancel</a></form></section></section><script>document.querySelector('#image-file').onchange=event=>document.querySelector('#image-preview').src=URL.createObjectURL(event.target.files[0]);</script></main>''')
+
+def admin_product_edit(data, product, message=''):
+    shipping_options = ''.join(f'<option {"selected" if product_shipping_class(product) == shipping_class else ""}>{shipping_class}</option>' for shipping_class in SHIPPING_CLASSES)
+    status = product.get('status', 'Active')
+    status_options = ''.join(f'<option {"selected" if status == value else ""}>{value}</option>' for value in ('Active', 'Draft', 'Archived'))
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / PRODUCTS / EDIT</p><h1>Edit <em>{esc(product.get('name', 'Product'))}.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<section class="panel"><form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="product_update"><input type="hidden" name="product_id" value="{product.get('id')}"><label>Product name<input name="name" value="{esc(product.get('name', ''))}" required></label><label>Short description<textarea name="short_description">{esc(product.get('short_description', ''))}</textarea></label><label>Description<textarea name="description">{esc(product.get('description', ''))}</textarea></label><label>SKU<input name="sku" value="{esc(product.get('sku', ''))}" required></label><label>Barcode<input name="barcode" value="{esc(product.get('barcode', ''))}"></label><label>Brand<input name="brand" value="{esc(product.get('brand', ''))}"></label><label>Selling price<input name="price" type="number" step="0.01" value="{product.get('price', 0)}" required></label><label>Sale/original price<input name="discount_price" type="number" step="0.01" value="{product.get('old_price') or ''}"></label><label>Cost price<input name="cost_price" type="number" step="0.01" value="{product.get('cost_price', 0)}"></label><label>Stock quantity<input name="stock" type="number" value="{product.get('stock', 0)}" required></label><label>Low-stock threshold<input name="minimum_stock" type="number" value="{product.get('minimum_stock', 5)}"></label><label>Category<select name="category" required>{category_options(data, product.get('category', ''))}</select></label><label>Subcategory<select name="subcategory" required>{subcategory_options(data, product.get('subcategory', ''))}</select></label><label>Shipping class<select name="shipping_class">{shipping_options}</select></label><label>Status<select name="status">{status_options}</select></label><label>Weight (kg)<input name="weight_kg" type="number" step="0.1" value="{product.get('weight_kg', 0.5)}"></label><label>Dimensions<input name="dimensions" value="{esc(product.get('dimensions', ''))}"></label><label>Product video URL<input name="video_url" value="{esc(product.get('video_url', ''))}"></label><label>Product images<input id="image-file" name="image_file" type="file" accept=".jpg,.jpeg,.png,.webp" multiple><img id="image-preview" class="upload-preview" src="{esc(product.get('image', ''))}" alt="Product preview"></label><label>Tags<input name="tags" value="{esc(', '.join(product.get('tags', [])))}"></label><label>Variants<small class="note">One per line: Name | Price | Stock</small><textarea name="variants">{esc('\n'.join(f'{variant.get("name", "")} | {variant.get("price", 0)} | {variant.get("stock", 0)}' for variant in product.get('variants', [])))}</textarea></label><button class="primary">Save product changes</button><a class="under" href="/admin">Cancel</a></form></section></section></main>''')
+
+def admin_inventory(data, message=''):
+    products = data.get('products', [])
+    valuation = sum(float(product.get('cost_price', 0) or 0) * int(product.get('stock', 0) or 0) for product in products)
+    rows = ''.join(f'<div class="table-row"><span><b>{esc(product.get("name", ""))}</b><small>{esc(product.get("sku", ""))} · {esc(product.get("barcode", ""))}</small></span><span>{product.get("stock", 0)}</span><span>{"Out of stock" if not product.get("stock") else "Low stock" if product.get("stock", 0) <= product.get("minimum_stock", 5) else "In stock"}</span><span><form method="post" class="inline-form"><input type="hidden" name="action" value="inventory_adjust"><input type="hidden" name="product_id" value="{product.get("id")}"><input name="amount" type="number" placeholder="+/- qty" required><input name="reason" placeholder="Reason" required><button>Adjust</button></form></span></div>' for product in products) or '<p class="empty">No products in inventory.</p>'
+    movements = ''.join(f'<div class="table-row"><span>{esc(item.get("date", ""))}</span><span>{esc(item.get("product_id", ""))}</span><span>{item.get("quantity_change", 0)}</span><span>{esc(item.get("reason", ""))}</span><span>{esc(item.get("user", "Admin"))}</span></div>' for item in reversed(data.get('inventory_movements', [])[-30:])) or '<p class="empty">No inventory movements recorded.</p>'
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / INVENTORY</p><h1>Stock <em>management.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<div class="stats"><div><span>Products</span><b>{len(products)}</b></div><div><span>Low stock</span><b>{sum(1 for product in products if 0 < product.get('stock', 0) <= product.get('minimum_stock', 5))}</b></div><div><span>Out of stock</span><b>{sum(1 for product in products if not product.get('stock'))}</b></div><div><span>Stock valuation</span><b>{money(valuation)}</b></div></div><section class="panel"><h2>Inventory</h2><div class="table"><div class="table-row table-head"><span>Product / SKU</span><span>Stock</span><span>Status</span><span>Adjust</span></div>{rows}</div></section><section class="panel"><h2>Stock history</h2><div class="table"><div class="table-row table-head"><span>Date</span><span>Product</span><span>Change</span><span>Reason</span><span>User</span></div>{movements}</div></section></section></main>''')
 
 def category_manager(data, message=''):
     groups = ''.join(f'<fieldset><legend>{esc(category)}</legend><textarea name="category_{index}" rows="{max(4, len(subcategories))}" aria-label="{esc(category)} subcategories">{esc("\n".join(subcategories))}</textarea><small class="note">One subcategory per line.</small></fieldset>' for index, (category, subcategories) in enumerate(category_groups(data).items()))
@@ -887,14 +1192,46 @@ def report_csv(data, report):
         for product in data.get('products', []):
             status = 'OUT OF STOCK' if not product.get('stock') else 'LOW STOCK' if product.get('stock', 0) <= product.get('minimum_stock', 5) else 'IN STOCK'
             writer.writerow([safe(product.get('name')), safe(product.get('sku')), safe(product.get('category')), product.get('price', 0), product.get('stock', 0), status])
+    elif report == 'financial':
+        product_costs = {product.get('id'): float(product.get('cost_price', 0) or 0) for product in data.get('products', [])}
+        expenses = sum(float(item.get('amount', 0) or 0) for item in data.get('expenses', []))
+        refunds = sum(float(item.get('amount', 0) or 0) for item in data.get('refunds', []) if item.get('status') in ('Processed', 'Refunded'))
+        revenue = sum(float(order.get('total', 0) or 0) for order in data.get('orders', []) if order.get('status') != 'Cancelled')
+        cogs = sum(product_costs.get(item.get('product_id'), 0) * int(item.get('quantity', 0)) for order in data.get('orders', []) for item in order.get('items', []))
+        writer.writerow(['Revenue', 'Cost of goods', 'Expenses', 'Refunds', 'Estimated net profit'])
+        writer.writerow([revenue, cogs, expenses, refunds, revenue - cogs - expenses - refunds])
     else:
         writer.writerow(['Order', 'Customer', 'Status', 'Payment', 'Total', 'Date'])
         for order in data.get('orders', []):
             writer.writerow([safe(order.get('order_number')), safe(order.get('customer_name')), order.get('status'), safe(order.get('payment_method')), order.get('total'), order.get('created_at')])
     return output.getvalue()
 
+def report_rows(data, report):
+    parsed = list(csv.reader(io.StringIO(report_csv(data, report))))
+    return parsed[0], parsed[1:]
+
+def report_xlsx(data, report):
+    header, rows = report_rows(data, report)
+    workbook = Workbook(); sheet = workbook.active; sheet.title = report[:31]
+    sheet.append(header)
+    for row in rows: sheet.append(row)
+    sheet.freeze_panes = 'A2'; sheet.auto_filter.ref = sheet.dimensions
+    output = io.BytesIO(); workbook.save(output); return output.getvalue()
+
+def report_pdf(data, report):
+    header, rows = report_rows(data, report)
+    output = io.BytesIO(); document = SimpleDocTemplate(output, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm)
+    table = Table([header] + rows, repeatRows=1)
+    table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3f5548')), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white), ('GRID', (0, 0), (-1, -1), 0.25, colors.HexColor('#dfe5dc')), ('FONTSIZE', (0, 0), (-1, -1), 7), ('VALIGN', (0, 0), (-1, -1), 'TOP')]))
+    document.build([table]); return output.getvalue()
+
+def report_print_page(data, report):
+    header, rows = report_rows(data, report)
+    table = '<table><thead><tr>' + ''.join(f'<th>{esc(value)}</th>' for value in header) + '</tr></thead><tbody>' + ''.join('<tr>' + ''.join(f'<td>{esc(value)}</td>' for value in row) + '</tr>' for row in rows) + '</tbody></table>'
+    return f'<!doctype html><html><head><title>{esc(report.title())} report</title><style>body{{font:12px Arial;color:#1f2924}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccd5cc;padding:6px;text-align:left}}th{{background:#3f5548;color:#fff}}@media print{{button{{display:none}}}}</style></head><body><button onclick="window.print()">Print</button><h1>{esc(report.title())}</h1>{table}</body></html>'
+
 def report_dashboard(data, report='sales'):
-    report_types = ('sales', 'users', 'payments', 'orders', 'inventory', 'customers', 'products')
+    report_types = ('sales', 'users', 'payments', 'orders', 'inventory', 'customers', 'products', 'financial')
     report = report if report in report_types else 'sales'
     orders = data.get('orders', [])
     revenue = sum(order.get('total', 0) for order in orders)
@@ -925,6 +1262,13 @@ def report_dashboard(data, report='sales'):
     elif report == 'customers':
         headings = ('Customer', 'Email', 'Orders', 'Spending')
         records = [(customer.get('name', ''), customer.get('email', ''), len([order for order in orders if order.get('customer_id') == customer.get('id')]), money(sum(order.get('total', 0) for order in orders if order.get('customer_id') == customer.get('id')))) for customer in data.get('customers', [])]
+    elif report == 'financial':
+        headings = ('Revenue', 'Cost of goods', 'Expenses', 'Refunds', 'Estimated net profit')
+        revenue = sum(float(order.get('total', 0) or 0) for order in orders if order.get('status') != 'Cancelled')
+        expenses = sum(float(item.get('amount', 0) or 0) for item in data.get('expenses', []))
+        refunds = sum(float(item.get('amount', 0) or 0) for item in data.get('refunds', []) if item.get('status') in ('Processed', 'Refunded'))
+        cogs = sum(float(next((product.get('cost_price', 0) for product in data.get('products', []) if product.get('id') == item.get('product_id')), 0) or 0) * int(item.get('quantity', 0)) for order in orders for item in order.get('items', []))
+        records = [(money(revenue), money(cogs), money(expenses), money(refunds), money(revenue - cogs - expenses - refunds))]
     else:
         headings = ('Product', 'SKU', 'Category', 'Price', 'Stock')
         records = [(product.get('name', ''), product.get('sku', ''), product.get('category', ''), money(product.get('price', 0)), product.get('stock', 0)) for product in data.get('products', [])]
@@ -947,7 +1291,7 @@ def logo_source_available(image):
         return (ROOT / 'uploads' / Path(image).name).is_file()
     return False
 
-def branding_settings(data, message=''):
+def branding_settings(data, message='', edit_zone_id=''):
     shop = data['shop']
     textarea_keys = {'description', 'delivery_information', 'return_policy', 'privacy_policy', 'terms', 'story_description', 'newsletter_description'}
 
@@ -961,7 +1305,7 @@ def branding_settings(data, message=''):
     def section(title, fields):
         return f'<section class="settings-section"><h2>{title}</h2>{"".join(field(key, label) for key, label in fields)}</section>'
 
-    controls = section('Store information', [('name','Shop name'),('tagline','Tagline'),('description','Description'),('phone','Phone'),('whatsapp','WhatsApp'),('email','Email'),('location','Physical location'),('business_hours','Business hours'),('country','Country'),('currency','Currency'),('delivery_fee','Delivery fee'),('free_delivery_threshold','Free delivery threshold'),('order_prefix','Order number prefix')])
+    controls = section('Store information', [('name','Shop name'),('tagline','Tagline'),('description','Description'),('phone','Phone'),('whatsapp','WhatsApp'),('email','Email'),('location','Physical location'),('business_hours','Business hours'),('country','Country'),('currency','Currency'),('delivery_fee','Delivery fee'),('free_delivery_threshold','Free delivery threshold'),('order_prefix','Order number prefix'),('invoice_prefix','Invoice number prefix'),('receipt_prefix','Receipt number prefix')])
     controls += f'<section class="settings-section"><h2>Brand assets</h2><label>Logo file<input name="logo_file" type="file" accept="image/*"><small class="note">Upload any image format, maximum 5 MB.</small></label><label>Favicon URL<input name="favicon" value="{esc(shop.get("favicon", ""))}"></label>{f'<img class="settings-logo-preview" src="{esc(shop.get("logo", ""))}" alt="Current logo">' if logo_source_available(shop.get("logo", "")) else ""}</section>'
     controls += section('Policies', [('delivery_information','Delivery information'),('return_policy','Return policy'),('privacy_policy','Privacy policy'),('terms','Terms and conditions')])
     controls += section('Brand story', [('story_heading','Brand story heading'),('story_description','Brand story description'),('newsletter_heading','Newsletter heading'),('newsletter_description','Newsletter description')])
@@ -978,7 +1322,15 @@ def branding_settings(data, message=''):
     hero = shop.setdefault('hero', {})
     hero_fields = ''.join(f'<label>Hero {label}<input name="hero_{key}" value="{esc(hero.get(key, ""))}"></label>' for key, label in (('heading', 'heading'), ('image', 'image URL'), ('primary_label', 'primary button label'), ('primary_link', 'primary button link'), ('secondary_label', 'secondary button label'), ('secondary_link', 'secondary button link')))
     controls += f'<section class="settings-section"><h2>Homepage hero</h2>{hero_fields}<label>Hero description<textarea name="hero_description">{esc(hero.get("description", ""))}</textarea></label>{theme}</section>'
-    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SETTINGS / SHOP INFORMATION</p><h1>Shop <em>branding.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="branding">{controls}<button class="primary">Save branding changes ✓</button></form></section></main>''', 'Shop branding settings')
+    shipping = delivery_settings(shop)
+    edit_zone = next((zone for zone in shipping['zones'] if str(zone.get('id', '')) == str(edit_zone_id)), None)
+    zone_rows = ''.join(f'<div class="table-row"><span><b>{esc(zone.get("name", "Unnamed zone"))}</b><small>{esc(", ".join(zone.get("locations", [])) if isinstance(zone.get("locations", []), list) else zone.get("locations", ""))}</small></span><span>{money(float(zone.get("base_fee", 0)))}</span><span>{money(float(zone.get("free_threshold", 0)))}</span><span>{"Active" if zone.get("active", True) else "Disabled"}</span><span><a class="under" href="/admin/settings?edit_zone={esc(zone.get("id", ""))}">Edit</a> <form method="post" class="inline-form"><input type="hidden" name="action" value="delivery_zone_toggle"><input type="hidden" name="zone_id" value="{esc(zone.get("id", ""))}"><button>{"Disable" if zone.get("active", True) else "Enable"}</button></form> <form method="post" class="inline-form"><input type="hidden" name="action" value="delivery_zone_delete"><input type="hidden" name="zone_id" value="{esc(zone.get("id", ""))}"><button>Delete</button></form></span></div>' for zone in shipping['zones']) or '<p class="empty">No delivery zones configured. The default fee will be used until you add one.</p>'
+    zone = edit_zone or {}
+    locations = zone.get('locations', [])
+    locations = ', '.join(locations) if isinstance(locations, list) else locations
+    class_fee_fields = ''.join(f'<label>{shipping_class} fee<input name="class_fee_{shipping_class.lower().replace(" ", "_")}" type="number" min="0" step="0.01" value="{esc(zone.get("shipping_class_fees", {}).get(shipping_class, ""))}"></label>' for shipping_class in SHIPPING_CLASSES if shipping_class not in ("Free Delivery", "Pickup Only"))
+    delivery_controls = f'''<section class="panel"><h2>Delivery & shipping</h2><form method="post" class="branding-form"><input type="hidden" name="action" value="delivery_settings"><div class="settings-section"><label>Enable delivery<select name="delivery_enabled"><option value="1" {"selected" if shipping.get("enabled", True) else ""}>On</option><option value="0" {"selected" if not shipping.get("enabled", True) else ""}>Off</option></select></label><label>Default method<select name="delivery_method"><option value="zone" {"selected" if shipping.get("method", "zone") == "zone" else ""}>Zone based</option><option value="weight" {"selected" if shipping.get("method") == "weight" else ""}>Weight based</option></select></label><label>Free delivery<select name="free_delivery_enabled"><option value="1" {"selected" if shipping.get("free_delivery_enabled", True) else ""}>On</option><option value="0" {"selected" if not shipping.get("free_delivery_enabled", True) else ""}>Off</option></select></label><label>Default free-delivery threshold (KSh)<input name="default_free_threshold" type="number" min="0" step="0.01" value="{esc(shipping.get("default_free_threshold", 10000))}"></label><label>Default delivery fee (KSh)<input name="default_fee" type="number" min="0" step="0.01" value="{esc(shipping.get("default_fee", 350))}"></label><button class="primary">Save delivery settings</button></div></form><div class="table"><div class="table-row table-head"><span>Zone / locations</span><span>Base fee</span><span>Free from</span><span>Status</span><span>Actions</span></div>{zone_rows}</div><h3>{"Edit" if edit_zone else "Add"} delivery zone</h3><form method="post" class="branding-form"><input type="hidden" name="action" value="delivery_zone_save"><input type="hidden" name="zone_id" value="{esc(zone.get("id", ""))}"><label>Zone name<input name="zone_name" required value="{esc(zone.get("name", ""))}"></label><label>Counties / towns<input name="zone_locations" required value="{esc(locations)}" placeholder="Nairobi County, Nairobi CBD"></label><label>Base delivery fee (KSh)<input name="zone_base_fee" type="number" min="0" step="0.01" required value="{esc(zone.get("base_fee", shipping.get("default_fee", 350)))}"></label><label>Free-delivery threshold (KSh)<input name="zone_free_threshold" type="number" min="0" step="0.01" required value="{esc(zone.get("free_threshold", shipping.get("default_free_threshold", 10000)))}"></label><label>Calculation type<select name="zone_calculation_type"><option value="fixed" {"selected" if zone.get("calculation_type", "fixed") == "fixed" else ""}>Fixed fee</option><option value="weight" {"selected" if zone.get("calculation_type") == "weight" else ""}>Weight based</option></select></label><label>First weight (kg)<input name="zone_first_weight" type="number" min="0" step="0.1" value="{esc(zone.get("first_weight_kg", 2))}"></label><label>Additional weight fee (KSh/kg)<input name="zone_additional_weight_fee" type="number" min="0" step="0.01" value="{esc(zone.get("additional_weight_fee", 0))}"></label>{class_fee_fields}<label>Active<select name="zone_active"><option value="1" selected>Active</option><option value="0" {"selected" if zone and not zone.get("active", True) else ""}>Disabled</option></select></label><button class="primary">Save zone</button>{f'<a class="under" href="/admin/settings">Cancel</a>' if edit_zone else ''}</form></section>'''
+    return layout(data, f'''<main class="admin-page"><section class="admin-content settings-page"><p class="eyebrow">ADMIN PANEL / SETTINGS / SHOP INFORMATION</p><h1>Shop <em>branding.</em></h1>{f'<p class="notice">✓ {esc(message)}</p>' if message else ''}<form method="post" enctype="multipart/form-data" class="branding-form"><input type="hidden" name="action" value="branding">{controls}<button class="primary">Save branding changes ✓</button></form>{delivery_controls}</section></main>''', 'Shop branding settings')
 
 class Store(BaseHTTPRequestHandler):
     def send_error(self, code, message=None, explain=None):
@@ -1031,11 +1383,13 @@ class Store(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError): return send_json(self, {'error': 'Invalid JSON'}, 400)
         data = read_db(); identifier = self.path.rstrip('/').rsplit('/', 1)[-1]; product = next((item for item in data.get('products', []) if str(item.get('id')) == identifier), None)
         if not product: return send_json(self, {'error': 'Product not found'}, 404)
+        before = {key: product.get(key) for key in ('name', 'sku', 'price', 'old_price', 'stock', 'active')}
         for key in ('name', 'sku', 'brand', 'category', 'subcategory', 'description', 'image'):
             if key in updates: product[key] = str(updates[key]).strip()
         for key in ('price', 'old_price', 'stock', 'minimum_stock'):
             if key in updates: product[key] = float(updates[key]) if key in ('price', 'old_price') else int(updates[key])
-        audit(data, session, 'product_update', f'{product["name"]} updated via API'); write_db(data); return send_json(self, product)
+        after = {key: product.get(key) for key in before}
+        audit(data, session, 'product_update', f'{product["name"]} updated via API', 'product', product['id'], before, after); write_db(data); return send_json(self, product)
 
     def do_DELETE(self):
         if not self.path.startswith('/api/products/'):
@@ -1071,7 +1425,7 @@ class Store(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.rate_limited(): return self.send_error(429, 'Please slow down and try again.')
-        parsed = urlparse(self.path); data = read_db(); session = self.session()
+        parsed = urlparse(self.path); data = read_db(); session = self.session(); session['_ip'] = self.client_address[0]
         if session.get('customer_id') and not session.get('admin') and session.get('email'):
             legacy_user = next((item for item in data.get('users', []) if item.get('email', '').lower() == session.get('email', '').lower() and is_admin_role(item.get('role'))), None)
             if legacy_user:
@@ -1105,8 +1459,16 @@ class Store(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header('Content-Type', 'image/' + target.suffix.lower().removeprefix('.')); self.send_header('Cache-Control', 'public, max-age=86400'); self.end_headers(); self.wfile.write(target.read_bytes()); return
         message = parse_qs(parsed.query).get('message',[''])[0]
         params = parse_qs(parsed.query)
+        page_permission = {'/admin': 'reports', '/admin/products': 'products', '/admin/products/edit': 'products', '/admin/categories': 'products', '/admin/inventory': 'inventory', '/admin/orders': 'orders', '/admin/customers': 'customers', '/admin/payments': 'payments', '/admin/deliveries': 'deliveries', '/admin/returns': 'refunds', '/admin/notifications': 'content', '/admin/search': 'content', '/admin/engagement': 'content', '/admin/expenses': 'expenses', '/admin/promotions': 'promotions', '/admin/reviews': 'content', '/admin/health': 'content', '/admin/security': 'content', '/admin/integrations': 'content', '/admin/assistant': 'reports', '/admin/reports': 'reports', '/admin/reports.csv': 'reports', '/admin/reports.xlsx': 'reports', '/admin/reports.pdf': 'reports', '/admin/reports.print': 'reports', '/admin/settings': 'content', '/admin/staff': 'content', '/admin/audit': 'content', '/admin/backup': 'content', '/admin/restore': 'content'}.get(parsed.path)
+        if page_permission and session.get('admin') and not role_can(data, session, page_permission):
+            return self.send_error(403, 'Your role does not have access to this admin area.')
         if parsed.path == '/api/categories': return send_json(self, [{'name': name, 'subcategories': subcategories} for name, subcategories in category_groups(data).items()])
         if parsed.path == '/api/settings': return send_json(self, data.get('shop', {}))
+        if parsed.path == '/api/delivery-quote':
+            if not session.get('customer_id'): return send_json(self, {'error': 'Sign in required'}, 401)
+            subtotal = sum(cart_item_price(data, item) * item.get('quantity', 0) for item in session.get('cart', []))
+            quote = delivery_quote(data, params.get('location', [''])[0], subtotal, session.get('cart', []))
+            return send_json(self, {'zone': (quote['zone'] or {}).get('name', 'Other Kenya'), 'fee': float(quote['fee']), 'reason': quote['reason'], 'subtotal': subtotal, 'total': subtotal + float(quote['fee'])})
         if parsed.path == '/api/products':
             page = max(1, int(params.get('page', ['1'])[0])); per_page = min(100, max(1, int(params.get('per_page', ['24'])[0])))
             search = params.get('q', [''])[0].lower(); category = params.get('category', [''])[0]; brand = params.get('brand', [''])[0]
@@ -1122,15 +1484,27 @@ class Store(BaseHTTPRequestHandler):
             return send_json(self, data.get('orders', []))
         if parsed.path == '/admin' and not session.get('admin'):
             body = login_page(data, 'Admin sign-in required.')
-        elif parsed.path == '/admin': body = admin(data, message)
-        elif parsed.path == '/admin/settings': body = branding_settings(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin': body = operations_dashboard(data, message, params)
+        elif parsed.path == '/admin/settings': body = branding_settings(data, message, params.get('edit_zone', [''])[0]) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/orders': body = admin_orders(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/payments': body = admin_payments(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/deliveries': body = admin_deliveries(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
-        elif parsed.path == '/admin/promotions': body = promotions_page(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
-        elif parsed.path == '/admin/reviews': body = admin_reviews(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/returns': body = admin_returns(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/notifications': body = admin_notifications(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/search': body = admin_search(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/expenses': body = admin_expenses(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/health': body = admin_health(data) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/security': body = admin_security(data) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/integrations': body = admin_integrations(data) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/assistant':
+            question = params.get('q', [''])[0]
+            body = admin_assistant(data, (question, assistant_answer(data, question))) if session.get('admin') and question else admin_assistant(data) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/promotions': body = promotions_manager(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/reviews': body = reviews_manager(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/engagement': body = admin_engagement(data) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/customers': body = admin_customers(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/products': body = admin_products(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
+        elif parsed.path == '/admin/inventory': body = admin_inventory(data, message) if session.get('admin') else login_page(data, 'Admin sign-in required.')
         elif parsed.path == '/admin/products/edit':
             product = next((p for p in data['products'] if str(p['id']) == params.get('id', [''])[0]), None)
             body = login_page(data, 'Admin sign-in required.') if not session.get('admin') else admin_product_edit(data, product, message) if product else layout(data, '<main class="empty"><h1>Product not found</h1><a class="primary" href="/admin">Return to admin</a></main>')
@@ -1141,12 +1515,22 @@ class Store(BaseHTTPRequestHandler):
         elif parsed.path == '/admin/backup':
             if not session.get('admin'): body = login_page(data, 'Admin sign-in required.')
             else:
-                backup = json.dumps(read_db(), ensure_ascii=False, indent=2).encode(); self.send_response(200); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Disposition', 'attachment; filename=luxe-backup.json'); self.end_headers(); self.wfile.write(backup); return
+                requested = params.get('download', [''])[0]
+                target = (ROOT / 'backups' / Path(requested).name).resolve() if requested else None
+                if target and target.parent == (ROOT / 'backups').resolve() and target.is_file():
+                    self.send_response(200); self.send_header('Content-Type', 'application/sql' if target.suffix == '.sql' else 'application/json'); self.send_header('Content-Disposition', f'attachment; filename={target.name}'); self.end_headers(); self.wfile.write(target.read_bytes()); return
+                body = admin_restore(data, message)
         elif parsed.path == '/admin/reports' and session.get('admin'):
             report = params.get('type', ['sales'])[0]
             body = report_dashboard(data, report)
         elif parsed.path == '/admin/reports.csv' and session.get('admin'):
             csv = report_csv(data, params.get('type', ['orders'])[0]); self.send_response(200); self.send_header('Content-Type', 'text/csv'); self.send_header('Content-Disposition', 'attachment; filename=report.csv'); self.end_headers(); self.wfile.write(csv.encode()); return
+        elif parsed.path == '/admin/reports.xlsx' and session.get('admin'):
+            report = params.get('type', ['orders'])[0]; output = report_xlsx(data, report); self.send_response(200); self.send_header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); self.send_header('Content-Disposition', f'attachment; filename={report}-report.xlsx'); self.end_headers(); self.wfile.write(output); return
+        elif parsed.path == '/admin/reports.pdf' and session.get('admin'):
+            report = params.get('type', ['orders'])[0]; output = report_pdf(data, report); self.send_response(200); self.send_header('Content-Type', 'application/pdf'); self.send_header('Content-Disposition', f'attachment; filename={report}-report.pdf'); self.end_headers(); self.wfile.write(output); return
+        elif parsed.path == '/admin/reports.print' and session.get('admin'):
+            self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.end_headers(); self.wfile.write(report_print_page(data, params.get('type', ['orders'])[0]).encode()); return
         elif parsed.path == '/login': body = login_page(data, message)
         elif parsed.path == '/forgot-password': body = forgot_password_page(data, message)
         elif parsed.path == '/reset-password': body = reset_password_page(data, params.get('email', [''])[0], message)
@@ -1164,16 +1548,20 @@ class Store(BaseHTTPRequestHandler):
             body = product_page(data, product, session) if product else layout(data, '<main class="empty"><h1>Product not found</h1></main>')
         elif parsed.path == '/cart': body = cart_page(data, session) if authenticated else login_page(data, 'Please sign in to view your bag.')
         elif parsed.path == '/checkout': body = checkout_page(data, session, message, params.get('payment', [''])[0] == 'whatsapp') if session.get('customer_id') else login_page(data, 'Please sign in or create an account before placing an order.')
-        elif parsed.path == '/receipt':
+        elif parsed.path in ('/receipt', '/invoice'):
             order_number = params.get('order', [''])[0]
             order = next((item for item in data.get('orders', []) if item.get('order_number') == order_number), None)
             owns_order = order and (session.get('admin') or order.get('customer_id') == session.get('customer_id'))
             if not owns_order:
                 return self.send_error(404, 'Receipt not found.')
-            receipt = receipt_pdf(data, order)
-            self.send_response(200); self.send_header('Content-Type', 'application/pdf'); self.send_header('Content-Disposition', f'attachment; filename=receipt-{order_number}.pdf'); self.send_header('Content-Length', str(len(receipt))); self.send_header('Cache-Control', 'no-store'); self.end_headers(); self.wfile.write(receipt); return
+            document_label = 'Invoice' if parsed.path == '/invoice' else 'Receipt'
+            document = receipt_pdf(data, order, document_label)
+            self.send_response(200); self.send_header('Content-Type', 'application/pdf'); self.send_header('Content-Disposition', f'attachment; filename={document_label.lower()}-{order_number}.pdf'); self.send_header('Content-Length', str(len(document))); self.send_header('Cache-Control', 'no-store'); self.end_headers(); self.wfile.write(document); return
         elif parsed.path == '/order-confirmation': body = order_confirmation_page(data, params.get('order', [''])[0], session.pop('whatsapp_order_url', '')) if params.get('order', [''])[0] else info_page(data, 'ORDER CONFIRMATION', 'Thank you for your order.', 'Your order has been received.', '<a class="primary" href="/account/orders">View my orders ↗</a>')
-        elif parsed.path == '/search': body = search_page(data, params)
+        elif parsed.path == '/search':
+            query_text = params.get('q', [''])[0].strip().lower()
+            result_count = sum(1 for product in data.get('products', []) if query_text and query_text in f'{product.get("name", "")} {product.get("brand", "")} {product.get("category", "")} {product.get("subcategory", "")} {product.get("sku", "")} {product.get("description", "")} {" ".join(product.get("tags", []))}'.lower())
+            record_search(data, query_text, result_count); write_db(data); body = search_page(data, params)
         elif parsed.path == '/shop': body = home(data, params)
         elif parsed.path == '/categories': body = categories_page(data)
         elif parsed.path.startswith('/category/'):
@@ -1197,7 +1585,7 @@ class Store(BaseHTTPRequestHandler):
         if self.rate_limited(): return self.send_error(429, 'Please slow down and try again.')
         length = int(self.headers.get('Content-Length', 0))
         if length > MAX_REQUEST_BYTES: return self.send_error(413)
-        data = read_db(); session = self.session(); raw = self.rfile.read(length); form = parse_form(self.headers.get('Content-Type', ''), raw); action = form.get('action',[''])[0]; message = ''
+        data = read_db(); session = self.session(); session['_ip'] = self.client_address[0]; raw = self.rfile.read(length); form = parse_form(self.headers.get('Content-Type', ''), raw); action = form.get('action',[''])[0]; message = ''
         if self.path == '/api/payments/mpesa/callback':
             try:
                 callback_data = json.loads(raw.decode('utf-8'))
@@ -1213,10 +1601,87 @@ class Store(BaseHTTPRequestHandler):
         csrf_valid = hmac.compare_digest(form.get('csrf', [''])[0], self.csrf_token(session))
         if not csrf_valid and action not in ('login', 'register'):
             return self.send_error(403, 'Your form session expired. Please refresh and try again.')
-        if action in ('settings', 'branding', 'stock', 'order_status', 'payment_status', 'delivery_status', 'coupon', 'coupon_toggle', 'coupon_delete', 'customer_toggle', 'staff_create', 'staff_toggle', 'review_moderate', 'product_create', 'product_update', 'product_delete', 'categories_save', 'feature', 'restore', 'clear_database') and not session.get('admin'): return self.send_error(403, 'Admin sign-in required.')
+        if action in ('settings', 'branding', 'search_settings', 'delivery_settings', 'delivery_zone_save', 'delivery_zone_toggle', 'delivery_zone_delete', 'backup_now', 'role_save', 'role_delete', 'notification_settings', 'email_invoice', 'expense_create', 'expense_delete', 'inventory_adjust', 'stock', 'order_status', 'payment_status', 'delivery_status', 'return_request', 'return_status', 'refund_create', 'coupon', 'campaign_create', 'coupon_toggle', 'coupon_delete', 'customer_toggle', 'staff_create', 'staff_toggle', 'review_moderate', 'product_create', 'product_update', 'product_delete', 'categories_save', 'feature', 'restore', 'clear_database') and not session.get('admin'): return self.send_error(403, 'Admin sign-in required.')
+        permission = action_permission(action)
+        if permission and session.get('admin') and not role_can(data, session, permission):
+            return self.send_error(403, f'Your role cannot perform {action.replace("_", " ")}.')
+        if action in ('role_save', 'role_delete') and not is_superadmin_role(session.get('role')):
+            return self.send_error(403, 'Only a superadmin can manage roles.')
         if action == 'settings': data['shop']['name'] = form.get('shop_name',[data['shop']['name']])[0].strip() or data['shop']['name']; message = 'Shop information saved'
+        if action == 'delivery_settings':
+            shipping = delivery_settings(data['shop'])
+            old_shipping = dict(shipping)
+            shipping['enabled'] = form.get('delivery_enabled', ['1'])[0] == '1'
+            shipping['method'] = form.get('delivery_method', ['zone'])[0] if form.get('delivery_method', ['zone'])[0] in ('zone', 'weight') else 'zone'
+            shipping['free_delivery_enabled'] = form.get('free_delivery_enabled', ['1'])[0] == '1'
+            shipping['default_free_threshold'] = max(0, float(form.get('default_free_threshold', [shipping['default_free_threshold']])[0]))
+            shipping['default_fee'] = max(0, float(form.get('default_fee', [shipping['default_fee']])[0]))
+            data['shop']['free_delivery_threshold'] = shipping['default_free_threshold']
+            data['shop']['delivery_fee'] = shipping['default_fee']
+            audit(data, session, 'settings_changed', 'Delivery settings changed', 'delivery_settings', 'default', old_shipping, shipping)
+            message = 'Delivery settings saved'; destination = '/admin/settings'
+        if action == 'notification_settings':
+            old_channels = data.setdefault('shop', {}).get('notification_channels', ['dashboard', 'email'])
+            allowed_channels = {'dashboard', 'email', 'sms', 'whatsapp'}
+            new_channels = [channel for channel in form.get('notification_channel', []) if channel in allowed_channels]
+            data['shop']['notification_channels'] = new_channels or ['dashboard']
+            audit(data, session, 'settings_changed', 'Notification channels changed', 'notifications', 'channels', old_channels, data['shop']['notification_channels'])
+            message = 'Notification channels saved'; destination = '/admin/notifications'
+        if action == 'role_save' and is_superadmin_role(session.get('role')):
+            role_name = form.get('role_name', [''])[0].strip().upper().replace(' ', '_')
+            permissions = [permission for permission in form.get('role_permission', []) if permission in {'products', 'orders', 'inventory', 'customers', 'payments', 'deliveries', 'promotions', 'expenses', 'refunds', 'reports', 'content'}]
+            if not role_name or role_name in {'SUPER_ADMIN', 'SUPERADMIN', 'ADMIN'}:
+                message = 'Choose a different custom role name'
+            else:
+                data.setdefault('shop', {}).setdefault('custom_roles', {})[role_name] = permissions
+                ROLE_PERMISSIONS[role_name] = set(permissions)
+                audit(data, session, 'role_created', f'{role_name} role created', 'role', role_name, None, {'permissions': permissions}); message = 'Custom role saved'
+            destination = '/admin/staff'
+        if action == 'role_delete' and is_superadmin_role(session.get('role')):
+            role_name = form.get('role_name', [''])[0].strip().upper()
+            if role_name in data.setdefault('shop', {}).setdefault('custom_roles', {}):
+                data['shop']['custom_roles'].pop(role_name, None); ROLE_PERMISSIONS.pop(role_name, None); audit(data, session, 'role_deleted', f'{role_name} role deleted', 'role', role_name); message = 'Custom role deleted'
+            destination = '/admin/staff'
+        if action == 'search_settings':
+            old_keywords = data.setdefault('shop', {}).get('seo_keywords', [])
+            keywords = [item.strip() for item in form.get('seo_keywords', [''])[0].replace('\n', ',').split(',') if item.strip()]
+            data['shop']['seo_keywords'] = keywords
+            audit(data, session, 'settings_changed', 'Search SEO keywords changed', 'search', 'seo_keywords', old_keywords, keywords)
+            message = 'Search settings saved'; destination = '/admin/search'
+        if action == 'expense_create':
+            try: amount = round(float(form.get('expense_amount', ['0'])[0]), 2)
+            except ValueError: amount = 0
+            if amount <= 0:
+                message = 'Expense amount must be greater than zero'
+            else:
+                expense_id = f'EXP-{datetime.now():%Y%m%d}-{secrets.token_hex(2).upper()}'
+                expense = {'id': expense_id, 'date': form.get('expense_date', [f'{datetime.now():%Y-%m-%d}'])[0], 'category': form.get('expense_category', ['Other'])[0], 'description': form.get('expense_description', [''])[0].strip(), 'amount': amount, 'created_by': session.get('customer_name', 'Admin')}
+                data.setdefault('expenses', []).append(expense); audit(data, session, 'expense_created', f'{expense_id} recorded', 'expense', expense_id, None, expense); message = 'Expense recorded'
+            destination = '/admin/expenses'
+        if action == 'expense_delete':
+            expense_id = form.get('expense_id', [''])[0]; expense = next((item for item in data.get('expenses', []) if item.get('id') == expense_id), None)
+            if expense:
+                data['expenses'].remove(expense); audit(data, session, 'expense_deleted', f'{expense_id} deleted', 'expense', expense_id, expense, None); message = 'Expense deleted'
+            destination = '/admin/expenses'
+        if action == 'delivery_zone_save':
+            shipping = delivery_settings(data['shop'])
+            zone_id = form.get('zone_id', [''])[0].strip() or secrets.token_hex(4)
+            zone = next((item for item in shipping['zones'] if str(item.get('id')) == zone_id), None)
+            if not zone:
+                zone = {'id': zone_id}
+                shipping['zones'].append(zone)
+            zone.update({'name': form.get('zone_name', [''])[0].strip(), 'locations': [place.strip() for place in form.get('zone_locations', [''])[0].split(',') if place.strip()], 'base_fee': max(0, float(form.get('zone_base_fee', ['0'])[0])), 'free_threshold': max(0, float(form.get('zone_free_threshold', ['0'])[0])), 'calculation_type': form.get('zone_calculation_type', ['fixed'])[0] if form.get('zone_calculation_type', ['fixed'])[0] in ('fixed', 'weight') else 'fixed', 'first_weight_kg': max(0, float(form.get('zone_first_weight', ['2'])[0])), 'additional_weight_fee': max(0, float(form.get('zone_additional_weight_fee', ['0'])[0])), 'active': form.get('zone_active', ['1'])[0] == '1'})
+            zone['shipping_class_fees'] = {shipping_class: max(0, float(form.get(f'class_fee_{shipping_class.lower().replace(" ", "_")}', ['0'])[0] or 0)) for shipping_class in SHIPPING_CLASSES if shipping_class not in ('Free Delivery', 'Pickup Only') and form.get(f'class_fee_{shipping_class.lower().replace(" ", "_")}', [''])[0].strip()}
+            message = 'Delivery zone saved'; destination = '/admin/settings'
+        if action in ('delivery_zone_toggle', 'delivery_zone_delete'):
+            shipping = delivery_settings(data['shop'])
+            zone = next((item for item in shipping['zones'] if str(item.get('id')) == form.get('zone_id', [''])[0]), None)
+            if zone and action == 'delivery_zone_toggle': zone['active'] = not zone.get('active', True); message = 'Delivery zone status updated'
+            elif zone: shipping['zones'].remove(zone); message = 'Delivery zone deleted'
+            destination = '/admin/settings'
         if action == 'branding':
-            for key in ('name','tagline','description','phone','whatsapp','email','location','business_hours','currency','country','delivery_fee','free_delivery_threshold','order_prefix','backup_schedule','backup_time','backup_day','backup_retention','logo','favicon','delivery_information','return_policy','privacy_policy','terms','story_heading','story_description','newsletter_heading','newsletter_description'):
+            old_shop = {key: data['shop'].get(key) for key in ('name', 'currency', 'delivery_fee', 'free_delivery_threshold', 'logo', 'default_theme')}
+            for key in ('name','tagline','description','phone','whatsapp','email','location','business_hours','currency','country','delivery_fee','free_delivery_threshold','order_prefix','invoice_prefix','receipt_prefix','backup_schedule','backup_time','backup_day','backup_retention','logo','favicon','delivery_information','return_policy','privacy_policy','terms','story_heading','story_description','newsletter_heading','newsletter_description'):
                 if key in form: data['shop'][key] = form[key][0].strip()
             for key in ('instagram', 'facebook', 'tiktok', 'x', 'youtube'):
                 form_key = f'social_{key}'
@@ -1248,6 +1713,8 @@ class Store(BaseHTTPRequestHandler):
             if os.name == 'nt':
                 threading.Thread(target=update_windows_backup_schedule_background, args=(dict(data['shop']),), daemon=True).start()
             message = 'Shop branding saved'; destination = '/admin/settings'
+            new_shop = {key: data['shop'].get(key) for key in old_shop}
+            audit(data, session, 'settings_changed', 'Shop settings changed', 'shop', 'settings', old_shop, new_shop)
         if action == 'categories_save':
             updated_categories = {}
             for index, category in enumerate(category_groups(data)):
@@ -1257,6 +1724,10 @@ class Store(BaseHTTPRequestHandler):
                 message = 'Each category must contain at least one subcategory'; destination = '/admin/categories'
             else:
                 data['category_hierarchy'] = updated_categories; message = 'Category hierarchy saved'; destination = '/admin/categories'
+        if action == 'backup_now':
+            target = create_backup(data)
+            audit(data, session, 'backup_created', f'Backup {target.name} created')
+            message = f'Backup created: {target.name}'; destination = '/admin/restore'
         if action == 'restore':
             try:
                 restored = validate_backup(form.get('backup_file', [''])[0])
@@ -1278,7 +1749,18 @@ class Store(BaseHTTPRequestHandler):
         if action == 'stock':
             product = next((p for p in data['products'] if str(p['id']) == form.get('product_id',[''])[0]), None)
             if product:
-                previous = product['stock']; product['stock'] = max(0, product['stock'] + int(form.get('amount',[0])[0])); data.setdefault('inventory_movements', []).append({'product_id': product['id'], 'quantity_change': product['stock'] - previous, 'previous_stock': previous, 'new_stock': product['stock'], 'reason': 'Admin adjustment', 'user': session.get('customer_id'), 'date': datetime.now().isoformat(timespec='seconds')}); message = f"{product['name']} inventory updated"
+                previous = product['stock']; product['stock'] = max(0, product['stock'] + int(form.get('amount',[0])[0])); data.setdefault('inventory_movements', []).append({'product_id': product['id'], 'quantity_change': product['stock'] - previous, 'previous_stock': previous, 'new_stock': product['stock'], 'reason': 'Admin adjustment', 'user': session.get('customer_id'), 'date': datetime.now().isoformat(timespec='seconds')}); audit(data, session, 'stock_adjusted', f'{product["name"]} stock adjusted', 'product', product['id'], {'stock': previous}, {'stock': product['stock'], 'reason': 'Admin adjustment'}); notify_event(data, 'out_of_stock' if product['stock'] == 0 else 'low_stock' if product['stock'] <= product.get('minimum_stock', 5) else 'stock_adjusted', 'Inventory alert', f'{product["name"]} stock is now {product["stock"]}', 'product', product['id']); message = f"{product['name']} inventory updated"
+        if action == 'inventory_adjust':
+            product = next((item for item in data.get('products', []) if str(item.get('id')) == form.get('product_id', [''])[0]), None)
+            try: amount = int(form.get('amount', ['0'])[0])
+            except ValueError: amount = 0
+            reason = form.get('reason', ['Admin adjustment'])[0].strip() or 'Admin adjustment'
+            if product and amount:
+                previous = product.get('stock', 0); product['stock'] = max(0, previous + amount); change = product['stock'] - previous
+                movement = {'product_id': product['id'], 'quantity_change': change, 'previous_stock': previous, 'new_stock': product['stock'], 'reason': reason, 'user': session.get('customer_name', 'Admin'), 'date': datetime.now().isoformat(timespec='seconds')}
+                data.setdefault('inventory_movements', []).append(movement); audit(data, session, 'stock_adjusted', f'{product["name"]} stock adjusted', 'product', product['id'], {'stock': previous}, {'stock': product['stock'], 'reason': reason}); message = f'{product["name"]} inventory updated'
+            else: message = 'Enter a valid stock adjustment'
+            destination = '/admin/inventory'
         if action == 'feature':
             product = next((p for p in data['products'] if str(p['id']) == form.get('product_id', [''])[0]), None)
             section = form.get('section', [''])[0]
@@ -1325,7 +1807,7 @@ class Store(BaseHTTPRequestHandler):
                 message = 'An account with that email already exists'; destination = '/register'
             else:
                 customer = {'id': max([c['id'] for c in data.get('customers', [])] or [0]) + 1, 'name': form.get('name', [''])[0].strip(), 'email': email, 'phone': form.get('phone', [''])[0].strip(), 'password_hash': hash_password(form.get('password', [''])[0]), 'active': True, 'created_at': datetime.now().isoformat(timespec='seconds')}
-                data.setdefault('customers', []).append(customer); session['customer_id'] = customer['id']; session['customer_name'] = customer['name']; session['email'] = email; had_pending = bool(session.get('pending_cart')); add_pending_cart(data, session); message = 'Account created. Your item is in the bag.' if had_pending else 'Account created'; destination = '/cart' if had_pending else '/account'
+                data.setdefault('customers', []).append(customer); notify_event(data, 'new_customer', 'New customer', f'{customer["name"]} created an account', 'customer', customer['id']); session['customer_id'] = customer['id']; session['customer_name'] = customer['name']; session['email'] = email; had_pending = bool(session.get('pending_cart')); add_pending_cart(data, session); message = 'Account created. Your item is in the bag.' if had_pending else 'Account created'; destination = '/cart' if had_pending else '/account'
         if action == 'forgot_request':
             email = form.get('email', [''])[0].strip().lower()
             user = next((u for u in data.get('users', []) + data.get('customers', []) if u.get('email', '').lower() == email and u.get('active', True)), None)
@@ -1360,7 +1842,7 @@ class Store(BaseHTTPRequestHandler):
             user = next((u for u in data.get('users', []) + data.get('customers', []) if u.get('email') == email and u.get('active', True)), None)
             if user and check_password(form.get('password', [''])[0], user.get('password_hash', '')):
                 session.pop('admin', None); session.pop('role', None); session.pop('email', None)
-                session['customer_id'] = user['id']; session['customer_name'] = user.get('name', 'Customer'); session['email'] = user.get('email', email); session['role'] = user.get('role', 'CUSTOMER'); session['admin'] = is_admin_role(session['role']); had_pending = bool(session.get('pending_cart')); add_pending_cart(data, session); destination = '/admin' if session['admin'] else '/cart' if had_pending else '/account'
+                session['customer_id'] = user['id']; session['customer_name'] = user.get('name', 'Customer'); session['email'] = user.get('email', email); session['role'] = user.get('role', 'CUSTOMER'); session['admin'] = is_admin_role(session['role']); audit(data, session, 'admin_login' if session['admin'] else 'login', f'{user.get("email", email)} signed in', 'user', user['id'], None, {'role': session['role']}); had_pending = bool(session.get('pending_cart')); add_pending_cart(data, session); destination = '/admin' if session['admin'] else '/cart' if had_pending else '/account'
             else: message = 'Invalid email or password'; destination = '/login'
         if action == 'account_update' and session.get('customer_id'):
             account = current_account(data, session)
@@ -1414,14 +1896,23 @@ class Store(BaseHTTPRequestHandler):
                 already_reviewed = any(r.get('product_id') == product_id and r.get('customer_id') == session['customer_id'] for r in data.get('reviews', []))
                 if not already_reviewed:
                     customer = next((c for c in data.get('customers', []) if c['id'] == session['customer_id']), {})
-                    data.setdefault('reviews', []).append({'id': len(data.get('reviews', [])) + 1, 'product_id': product_id, 'customer_id': session['customer_id'], 'customer_name': customer.get('name', 'Customer'), 'rating': max(1, min(5, int(form.get('rating', ['5'])[0]))), 'text': form.get('text', [''])[0].strip(), 'approved': False, 'created_at': datetime.now().isoformat(timespec='seconds')})
+                    review_id = len(data.get('reviews', [])) + 1; data.setdefault('reviews', []).append({'id': review_id, 'product_id': product_id, 'customer_id': session['customer_id'], 'customer_name': customer.get('name', 'Customer'), 'rating': max(1, min(5, int(form.get('rating', ['5'])[0]))), 'text': form.get('text', [''])[0].strip(), 'approved': False, 'created_at': datetime.now().isoformat(timespec='seconds')}); notify_event(data, 'new_review', 'New review', f'{customer.get("name", "Customer")} submitted a review', 'review', review_id)
                     message = 'Review submitted for admin approval'; destination = '/product?id=' + str(product_id)
         if action == 'review' and not session.get('customer_id'):
             message = 'Sign in before reviewing a product'; destination = '/login'
         if action == 'order_status' and session.get('admin'):
             order = next((o for o in data.get('orders', []) if o.get('order_number') == form.get('order_number', [''])[0]), None)
             if order:
-                old_status = order.get('status', 'Pending'); order['status'] = form.get('status', ['Pending'])[0]; data.setdefault('audit_logs', []).append({'user': session.get('customer_name', 'Admin'), 'action': 'order_status', 'description': f'{order["order_number"]}: {old_status} to {order["status"]}', 'ip_address': self.client_address[0], 'date': datetime.now().isoformat(timespec='seconds')}); message = 'Order status updated'; destination = '/admin/orders'
+                old_status = order.get('status', 'Pending'); order['status'] = form.get('status', ['Pending'])[0]; audit(data, session, 'order_status', f'{order["order_number"]}: {old_status} to {order["status"]}', 'order', order.get('order_number'), {'status': old_status}, {'status': order['status']}); message = 'Order status updated'; destination = '/admin/orders'
+        if action == 'email_invoice' and session.get('admin'):
+            order = next((item for item in data.get('orders', []) if item.get('order_number') == form.get('order_number', [''])[0]), None)
+            if order:
+                try:
+                    email_document(data, order, 'Invoice'); audit(data, session, 'invoice_emailed', f'Invoice emailed for {order["order_number"]}', 'order', order['order_number']); message = 'Invoice emailed to customer'
+                except (OSError, RuntimeError, smtplib.SMTPException) as error:
+                    message = f'Invoice email failed: {error}'
+            else: message = 'Order not found'
+            destination = '/admin/orders'
         if action in ('payment_status', 'delivery_status') and session.get('admin'):
             order = next((o for o in data.get('orders', []) if o.get('order_number') == form.get('order_number', [''])[0]), None)
             if order:
@@ -1433,14 +1924,22 @@ class Store(BaseHTTPRequestHandler):
                     if previous_status != 'Delivered':
                         order['delivered_at'] = datetime.now().isoformat(timespec='seconds')
                         threading.Thread(target=notify_order_delivered, args=(data, dict(order)), daemon=True).start()
-                audit(data, session, action, f'{order["order_number"]}: {order[key]}')
+                audit(data, session, action, f'{order["order_number"]}: {order[key]}', 'order', order.get('order_number'), {key: previous_status}, {key: order[key]})
+                if action == 'payment_status': notify_event(data, 'successful_payment' if order[key] == 'Paid' else 'failed_payment' if order[key] == 'Failed' else 'payment_updated', 'Payment update', f'{order["order_number"]} payment is {order[key]}', 'order', order.get('order_number'))
                 message = 'Payment updated' if action == 'payment_status' else 'Delivery updated'
                 destination = '/admin/payments' if action == 'payment_status' else '/admin/deliveries'
         if action == 'coupon' and session.get('admin'):
             code = form.get('code', [''])[0].strip().upper()
             if not any(c.get('code') == code for c in data.get('coupons', [])):
-                data.setdefault('coupons', []).append({'code': code, 'type': 'percentage', 'value': int(form.get('value', ['0'])[0]), 'minimum_order': 0, 'usage_limit': int(form.get('usage_limit', ['100'])[0]), 'used': 0, 'active': True})
+                coupon_type = form.get('coupon_type', ['percentage'])[0] if form.get('coupon_type', ['percentage'])[0] in ('percentage', 'fixed') else 'percentage'
+                try: value = float(form.get('value', ['0'])[0])
+                except ValueError: value = 0
+                data.setdefault('coupons', []).append({'code': code, 'type': coupon_type, 'value': max(0, value), 'minimum_order': max(0, float(form.get('minimum_order', ['0'])[0] or 0)), 'maximum_discount': max(0, float(form.get('maximum_discount', ['0'])[0] or 0)), 'expiry_date': form.get('expiry_date', [''])[0], 'usage_limit': max(0, int(form.get('usage_limit', ['100'])[0] or 0)), 'per_customer_limit': max(0, int(form.get('per_customer_limit', ['0'])[0] or 0)), 'categories': [item.strip() for item in form.get('coupon_categories', [''])[0].split(',') if item.strip()], 'product_ids': [int(item.strip()) for item in form.get('coupon_products', [''])[0].split(',') if item.strip().isdigit()], 'used': 0, 'active': True})
                 message = 'Coupon created'; destination = '/admin/promotions'
+        if action == 'campaign_create' and session.get('admin'):
+            campaign_id = f'CAM-{datetime.now():%Y%m%d}-{secrets.token_hex(2).upper()}'
+            campaign = {'id': campaign_id, 'name': form.get('campaign_name', [''])[0].strip(), 'type': form.get('campaign_type', ['Promotion'])[0], 'starts_at': form.get('campaign_starts', [''])[0], 'ends_at': form.get('campaign_ends', [''])[0], 'active': True, 'created_at': datetime.now().isoformat(timespec='seconds')}
+            data.setdefault('campaigns', []).append(campaign); audit(data, session, 'campaign_created', f'{campaign["name"]} created', 'campaign', campaign_id, None, campaign); message = 'Campaign created'; destination = '/admin/promotions'
         if action in ('coupon_toggle', 'coupon_delete') and session.get('admin'):
             code = form.get('code', [''])[0].strip().upper()
             coupon = next((item for item in data.get('coupons', []) if item.get('code') == code), None)
@@ -1454,11 +1953,14 @@ class Store(BaseHTTPRequestHandler):
             if customer: customer['active'] = not customer.get('active', True); message = 'Customer status updated'; destination = '/admin/customers'
         if action == 'staff_create' and session.get('admin'):
             email = form.get('staff_email', [''])[0].strip().lower()
-            if any(user.get('email') == email for user in data.get('users', [])):
+            requested_role = form.get('staff_role', ['STORE_MANAGER'])[0]
+            if requested_role not in ROLE_PERMISSIONS and requested_role != 'ADMIN':
+                message = 'Invalid staff role'
+            elif any(user.get('email') == email for user in data.get('users', [])):
                 message = 'A staff account with that email already exists'
             else:
                 staff_id = max([user.get('id', 0) for user in data.get('users', [])] or [0]) + 1
-                data.setdefault('users', []).append({'id': staff_id, 'name': form.get('staff_name', [''])[0].strip(), 'email': email, 'password_hash': hash_password(form.get('staff_password', [''])[0]), 'role': form.get('staff_role', ['STAFF'])[0], 'active': True}); audit(data, session, 'staff_create', f'{email} staff account created'); message = 'Staff account created'
+                data.setdefault('users', []).append({'id': staff_id, 'name': form.get('staff_name', [''])[0].strip(), 'email': email, 'password_hash': hash_password(form.get('staff_password', [''])[0]), 'role': requested_role, 'active': True}); audit(data, session, 'staff_create', f'{email} staff account created', 'user', staff_id, None, {'role': requested_role}); message = 'Staff account created'
             destination = '/admin/staff'
         if action == 'staff_toggle' and session.get('admin'):
             staff_id = int(form.get('staff_id', [0])[0])
@@ -1471,20 +1973,52 @@ class Store(BaseHTTPRequestHandler):
             if review and decision == 'delete': data['reviews'].remove(review)
             elif review: review['approved'] = decision == 'approve'; review['hidden'] = decision == 'hide'
             message = 'Review moderation saved'; destination = '/admin/reviews'
+        if action == 'return_request' and session.get('admin'):
+            order_number = form.get('order_number', [''])[0].strip()
+            order = next((item for item in data.get('orders', []) if item.get('order_number') == order_number), None)
+            if not order:
+                message = 'Order not found'
+            else:
+                product_id = int(form.get('product_id', ['0'])[0] or 0)
+                product = next((item for item in data.get('products', []) if item.get('id') == product_id), None) if product_id else None
+                return_id = f'RET-{datetime.now():%Y%m%d}-{secrets.token_hex(2).upper()}'
+                data.setdefault('returns', []).append({'id': return_id, 'order_number': order_number, 'customer_id': order.get('customer_id'), 'customer_name': order.get('customer_name', 'Customer'), 'product_id': product_id or None, 'product_name': product.get('name', 'All items') if product else 'All items', 'reason': form.get('return_reason', [''])[0].strip(), 'status': 'Requested', 'created_at': datetime.now().isoformat(timespec='seconds')})
+                audit(data, session, 'return_requested', f'{return_id} created for {order_number}', 'return', return_id, None, {'status': 'Requested', 'order_number': order_number}); message = 'Return request created'
+            destination = '/admin/returns'
+        if action == 'return_status' and session.get('admin'):
+            return_id = form.get('return_id', [''])[0]
+            return_item = next((item for item in data.get('returns', []) if item.get('id') == return_id), None)
+            if return_item:
+                old_status = return_item.get('status', 'Requested'); new_status = form.get('return_status', ['Requested'])[0]
+                return_item['status'] = new_status; return_item['updated_at'] = datetime.now().isoformat(timespec='seconds')
+                audit(data, session, 'return_status', f'{return_id}: {old_status} to {new_status}', 'return', return_id, {'status': old_status}, {'status': new_status}); message = 'Return status updated'
+            destination = '/admin/returns'
+        if action == 'refund_create' and session.get('admin'):
+            order_number = form.get('order_number', [''])[0].strip(); order = next((item for item in data.get('orders', []) if item.get('order_number') == order_number), None)
+            try: amount = round(float(form.get('refund_amount', ['0'])[0]), 2)
+            except ValueError: amount = 0
+            if not order or amount <= 0 or amount > float(order.get('total', 0)):
+                message = 'Refund amount must be greater than zero and no more than the order total'
+            else:
+                reference = f'REF-{datetime.now():%Y%m%d}-{secrets.token_hex(2).upper()}'
+                data.setdefault('refunds', []).append({'reference': reference, 'order_number': order_number, 'customer_id': order.get('customer_id'), 'amount': amount, 'method': order.get('payment_method', 'Unknown'), 'reason': form.get('refund_reason', [''])[0].strip(), 'status': 'Pending', 'created_at': datetime.now().isoformat(timespec='seconds')})
+                audit(data, session, 'refund_requested', f'{reference} recorded for {order_number}', 'refund', reference, None, {'status': 'Pending', 'amount': amount}); message = 'Pending refund recorded'
+            destination = '/admin/returns'
         if action == 'product_create' and session.get('admin'):
             product_id = max([p['id'] for p in data['products']] or [0]) + 1; image_files = [image.strip() for image in form.get('image_file', []) if image.strip()]; image = image_files[0] if image_files else ''
             variants = []
             for index, line in enumerate(form.get('variants', [''])[0].splitlines(), 1):
                 parts = [part.strip() for part in line.split('|')]
                 if len(parts) == 3 and parts[0]: variants.append({'id': index, 'name': parts[0], 'price': float(parts[1]), 'stock': max(0, int(float(parts[2]))), 'active': True})
-            data['products'].append({'id': product_id, 'name': form.get('name', [''])[0].strip(), 'sku': form.get('sku', [''])[0].strip(), 'brand': form.get('brand', [''])[0].strip(), 'category': form.get('category', [''])[0].strip(), 'subcategory': form.get('subcategory', [''])[0].strip(), 'price': float(form.get('price', ['0'])[0]), 'old_price': float(form.get('discount_price', ['0'])[0]) or None, 'stock': int(float(form.get('stock', ['0'])[0])), 'minimum_stock': int(float(form.get('minimum_stock', ['5'])[0])), 'rating': 0, 'tag': 'New', 'image': image, 'images': image_files, 'variants': variants, 'description': form.get('description', [''])[0].strip(), 'tags': [tag.strip() for tag in form.get('tags', [''])[0].split(',') if tag.strip()], 'created_at': datetime.now().isoformat(timespec='seconds')})
+            data['products'].append({'id': product_id, 'name': form.get('name', [''])[0].strip(), 'short_description': form.get('short_description', [''])[0].strip(), 'sku': form.get('sku', [''])[0].strip(), 'barcode': form.get('barcode', [''])[0].strip(), 'brand': form.get('brand', [''])[0].strip(), 'category': form.get('category', [''])[0].strip(), 'subcategory': form.get('subcategory', [''])[0].strip(), 'price': float(form.get('price', ['0'])[0]), 'old_price': float(form.get('discount_price', ['0'])[0]) or None, 'cost_price': max(0, float(form.get('cost_price', ['0'])[0] or 0)), 'stock': int(float(form.get('stock', ['0'])[0])), 'minimum_stock': int(float(form.get('minimum_stock', ['5'])[0])), 'shipping_class': form.get('shipping_class', ['Standard'])[0] if form.get('shipping_class', ['Standard'])[0] in SHIPPING_CLASSES else 'Standard', 'weight_kg': max(0, float(form.get('weight_kg', ['0.5'])[0])), 'dimensions': form.get('dimensions', [''])[0].strip(), 'video_url': form.get('video_url', [''])[0].strip(), 'status': form.get('status', ['Active'])[0] if form.get('status', ['Active'])[0] in ('Active', 'Draft', 'Archived') else 'Active', 'active': form.get('status', ['Active'])[0] == 'Active', 'rating': 0, 'tag': 'New', 'image': image, 'images': image_files, 'variants': variants, 'description': form.get('description', [''])[0].strip(), 'tags': [tag.strip() for tag in form.get('tags', [''])[0].split(',') if tag.strip()], 'created_at': datetime.now().isoformat(timespec='seconds')})
             message = 'Product created'; destination = '/admin/products'
         if action == 'product_update' and session.get('admin'):
             product = next((p for p in data['products'] if str(p['id']) == form.get('product_id', [''])[0]), None)
             if product:
-                for key in ('name', 'sku', 'brand', 'category', 'subcategory', 'description'):
+                before = {key: product.get(key) for key in ('name', 'sku', 'price', 'old_price', 'stock', 'minimum_stock', 'shipping_class', 'weight_kg')}
+                for key in ('name', 'short_description', 'sku', 'barcode', 'brand', 'category', 'subcategory', 'description', 'dimensions', 'video_url'):
                     product[key] = form.get(key, [product.get(key, '')])[0].strip()
-                product['price'] = float(form.get('price', [product['price']])[0]); product['old_price'] = float(form.get('discount_price', [product.get('old_price') or 0])[0]) or None; product['stock'] = max(0, int(float(form.get('stock', [product['stock']])[0]))); product['minimum_stock'] = max(0, int(float(form.get('minimum_stock', [product.get('minimum_stock', 5)])[0]))); product['tags'] = [tag.strip() for tag in form.get('tags', [', '.join(product.get('tags', []))])[0].split(',') if tag.strip()]
+                product['price'] = float(form.get('price', [product['price']])[0]); product['old_price'] = float(form.get('discount_price', [product.get('old_price') or 0])[0]) or None; product['cost_price'] = max(0, float(form.get('cost_price', [product.get('cost_price', 0)])[0] or 0)); product['stock'] = max(0, int(float(form.get('stock', [product['stock']])[0]))); product['minimum_stock'] = max(0, int(float(form.get('minimum_stock', [product.get('minimum_stock', 5)])[0]))); product['shipping_class'] = form.get('shipping_class', [product_shipping_class(product)])[0] if form.get('shipping_class', [product_shipping_class(product)])[0] in SHIPPING_CLASSES else product_shipping_class(product); product['weight_kg'] = max(0, float(form.get('weight_kg', [product.get('weight_kg', 0.5)])[0])); product['status'] = form.get('status', [product.get('status', 'Active')])[0] if form.get('status', [product.get('status', 'Active')])[0] in ('Active', 'Draft', 'Archived') else product.get('status', 'Active'); product['active'] = product['status'] == 'Active'; product['tags'] = [tag.strip() for tag in form.get('tags', [', '.join(product.get('tags', []))])[0].split(',') if tag.strip()]
                 image_files = [image.strip() for image in form.get('image_file', []) if image.strip()]
                 if image_files: product['image'] = image_files[0]; product['images'] = image_files
                 variants = []
@@ -1492,6 +2026,8 @@ class Store(BaseHTTPRequestHandler):
                     parts = [part.strip() for part in line.split('|')]
                     if len(parts) == 3 and parts[0]: variants.append({'id': index, 'name': parts[0], 'price': float(parts[1]), 'stock': max(0, int(float(parts[2]))), 'active': True})
                 if 'variants' in form: product['variants'] = variants
+                after = {key: product.get(key) for key in before}
+                audit(data, session, 'product_update', f'{product["name"]} updated', 'product', product['id'], before, after)
                 message = 'Product updated'; destination = '/admin'
         if action == 'product_delete' and is_superadmin_role(session.get('role')):
             product = next((p for p in data['products'] if str(p['id']) == form.get('product_id', [''])[0]), None)
@@ -1512,16 +2048,22 @@ class Store(BaseHTTPRequestHandler):
             checkout_coupon = next((coupon for coupon in data.get('coupons', []) if coupon.get('code') == form.get('coupon_code', [''])[0].strip().upper() and coupon.get('active', True)), None)
             if checkout_coupon:
                 subtotal_for_coupon = sum(cart_item_price(data, item) * item['quantity'] for item in session['cart'])
-                checkout_discount = subtotal_for_coupon * checkout_coupon.get('value', 0) / 100 if checkout_coupon.get('type') == 'percentage' else checkout_coupon.get('value', 0)
+                checkout_discount = coupon_discount(data, checkout_coupon, subtotal_for_coupon, session['cart'], session.get('customer_id'))
             order_prefix = str(data.get('shop', {}).get('order_prefix', 'ORD')).strip().upper() or 'ORD'
             order_number = order_prefix + '-' + datetime.now().strftime('%Y%m%d') + '-' + secrets.token_hex(2).upper()
+            invoice_prefix = str(data.get('shop', {}).get('invoice_prefix', 'INV')).strip().upper() or 'INV'
+            receipt_prefix = str(data.get('shop', {}).get('receipt_prefix', 'RCT')).strip().upper() or 'RCT'
             subtotal = sum(cart_item_price(data, item) * item['quantity'] for item in session['cart'])
-            free_delivery_threshold = shop_number(data, 'free_delivery_threshold', 10000)
-            configured_delivery_fee = shop_number(data, 'delivery_fee', 350)
-            delivery_fee = 0 if subtotal >= free_delivery_threshold else configured_delivery_fee
+            discount = min(checkout_discount, subtotal)
+            eligible_subtotal = subtotal - discount
+            delivery_location = form.get('location', [''])[0].strip()
+            delivery_result = delivery_quote(data, delivery_location, eligible_subtotal, session['cart'])
+            delivery_fee = float(delivery_result['fee'])
             order_payment_method = form.get('payment_method', ['M-Pesa'])[0]
-            order = {'order_number': order_number, 'customer_id': session.get('customer_id'), 'status': 'Pending', 'payment_method': order_payment_method, 'payment_status': 'Pending', 'mpesa_phone': mpesa_phone if order_payment_method == 'M-Pesa' else '', 'subtotal': subtotal, 'discount': 0, 'delivery_fee': delivery_fee, 'total': subtotal + delivery_fee, 'customer_name': form.get('full_name', [''])[0], 'phone': form.get('phone', [''])[0], 'email': form.get('email', [''])[0], 'address': form.get('address', [''])[0], 'location': form.get('location', [''])[0], 'created_at': datetime.now().isoformat(timespec='seconds'), 'items': [{'product_id': item['id'], 'variant_id': item.get('variant_id'), 'quantity': item['quantity'], 'unit_price': cart_item_price(data, item)} for item in session['cart']]}
+            document_suffix = datetime.now().strftime('%Y%m%d') + '-' + secrets.token_hex(2).upper()
+            order = {'order_number': order_number, 'invoice_number': f'{invoice_prefix}-{document_suffix}', 'receipt_number': f'{receipt_prefix}-{document_suffix}', 'customer_id': session.get('customer_id'), 'status': 'Pending', 'payment_method': order_payment_method, 'payment_status': 'Pending', 'mpesa_phone': mpesa_phone if order_payment_method == 'M-Pesa' else '', 'subtotal': subtotal, 'coupon_code': checkout_coupon.get('code') if checkout_coupon and checkout_discount else '', 'discount': discount, 'eligible_subtotal': eligible_subtotal, 'delivery_fee': delivery_fee, 'delivery_zone': (delivery_result['zone'] or {}).get('name', 'Other Kenya'), 'delivery_calculation': delivery_result['reason'], 'total': eligible_subtotal + delivery_fee, 'customer_name': form.get('full_name', [''])[0], 'phone': form.get('phone', [''])[0], 'email': form.get('email', [''])[0], 'address': form.get('address', [''])[0], 'location': delivery_location, 'created_at': datetime.now().isoformat(timespec='seconds'), 'items': [{'product_id': item['id'], 'variant_id': item.get('variant_id'), 'quantity': item['quantity'], 'unit_price': cart_item_price(data, item)} for item in session['cart']]}
             data.setdefault('orders', []).append(order)
+            notify_event(data, 'new_order', 'New order', f'{order_number} was placed by {order.get("customer_name", "Customer")}', 'order', order_number)
             if order_payment_method == 'M-Pesa':
                 try:
                     stk_response = initiate_mpesa(data, mpesa_phone, order['total'], order_number)
@@ -1552,7 +2094,7 @@ class Store(BaseHTTPRequestHandler):
                 session['cart'] = []; message = f'Order {order_number} confirmed'
                 checkout_completed = True
             if checkout_coupon and data.get('orders'):
-                order = data['orders'][-1]; order['discount'] = min(checkout_discount, order['subtotal']); order['total'] = order['subtotal'] - order['discount'] + order['delivery_fee']; checkout_coupon['used'] = checkout_coupon.get('used', 0) + 1
+                checkout_coupon['used'] = checkout_coupon.get('used', 0) + 1
         write_db(data)
         if 'destination' not in locals():
             destination = '/cart' if action in ('cart', 'cart_remove', 'cart_update') else '/admin'
